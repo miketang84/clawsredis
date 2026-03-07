@@ -1,11 +1,11 @@
-use std::collections::{BTreeSet, HashMap};
+use bincode::error::{DecodeError, EncodeError};
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::io::Read;
-use std::time::Instant;
-use bincode::{Encode, Decode};
-use bincode::error::{EncodeError, DecodeError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A simple in-memory key-value store with pub/sub support, TTL/expiration, and persistence.
 #[derive(Serialize, Deserialize, Encode, Decode)]
@@ -37,6 +37,13 @@ impl Default for KVStore {
 
 impl KVStore {
     /// Creates a new empty `KVStore`.
+
+    fn now_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before UNIX_EPOCH")
+            .as_secs()
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -45,7 +52,7 @@ impl KVStore {
     pub fn set_with_ttl(&mut self, key: String, value: String, ttl: Option<u64>) {
         self.data.insert(key.clone(), value);
         if let Some(ttl_seconds) = ttl {
-            let expiration = Instant::now().elapsed().as_secs() + ttl_seconds;
+            let expiration = Self::now_seconds() + ttl_seconds;
             self.expiration.insert(key, expiration);
         } else {
             self.expiration.remove(&key);
@@ -60,7 +67,7 @@ impl KVStore {
     /// Gets a value by key, automatically expiring it if TTL has passed.
     pub fn get(&mut self, key: &str) -> Option<&String> {
         if let Some(expiration) = self.expiration.get(key) {
-            let now = Instant::now().elapsed().as_secs();
+            let now = Self::now_seconds();
             if now >= *expiration {
                 self.data.remove(key);
                 self.expiration.remove(key);
@@ -89,10 +96,7 @@ impl KVStore {
     pub fn subscribe(&mut self, channel: String) -> usize {
         let id = self.next_sub_id;
         self.next_sub_id += 1;
-        self.subscribers
-            .entry(channel)
-            .or_default()
-            .insert(id);
+        self.subscribers.entry(channel).or_default().insert(id);
         id
     }
 
@@ -139,11 +143,12 @@ impl KVStore {
         let mut file = fs::File::open(path)?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)?;
-        let (mut store, _): (KVStore, _) = match bincode::decode_from_slice(&contents, bincode::config::standard()) {
-            Ok(s) => s,
-            Err(DecodeError::Io { inner, .. }) => return Err(inner),
-            Err(err) => return Err(io::Error::other(err.to_string())),
-        };
+        let (mut store, _): (KVStore, _) =
+            match bincode::decode_from_slice(&contents, bincode::config::standard()) {
+                Ok(s) => s,
+                Err(DecodeError::Io { inner, .. }) => return Err(inner),
+                Err(err) => return Err(io::Error::other(err.to_string())),
+            };
         // Clear expiration times since they're relative to when the data was saved
         store.expiration.clear();
         store.persist_path = Some(path.to_string());
@@ -162,7 +167,7 @@ impl KVStore {
     /// Get remaining TTL for a key in seconds. Returns None if key doesn't exist or has no TTL.
     pub fn ttl(&self, key: &str) -> Option<i64> {
         if let Some(expiration) = self.expiration.get(key) {
-            let now = Instant::now().elapsed().as_secs();
+            let now = Self::now_seconds();
             let remaining = *expiration as i64 - now as i64;
             if remaining > 0 {
                 Some(remaining)
@@ -179,7 +184,7 @@ impl KVStore {
     /// Set expiration for an existing key.
     pub fn expire(&mut self, key: &str, ttl_seconds: u64) -> bool {
         if self.data.contains_key(key) {
-            let expiration = Instant::now().elapsed().as_secs() + ttl_seconds;
+            let expiration = Self::now_seconds() + ttl_seconds;
             self.expiration.insert(key.to_string(), expiration);
             true
         } else {
@@ -264,12 +269,27 @@ mod tests {
     }
 
     #[test]
+    fn test_ttl_decreases_after_elapsed_time() {
+        let mut store = KVStore::new();
+        store.set_with_ttl("key1".to_string(), "value1".to_string(), Some(3));
+
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        let remaining = store.ttl("key1").expect("key should still have TTL");
+        assert!(
+            remaining > 0,
+            "TTL should still be non-zero after a short delay"
+        );
+        assert!(remaining < 3, "TTL should decrease after elapsed time");
+    }
+
+    #[test]
     fn test_expire_command() {
         let mut store = KVStore::new();
         store.set("key1".to_string(), "value1".to_string());
         assert!(store.expire("key1", 3600));
         assert!(store.ttl("key1").map(|t| t > 0).unwrap_or(false));
-        
+
         // Non-existent key
         assert!(!store.expire("nonexistent", 3600));
     }
