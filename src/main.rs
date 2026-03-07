@@ -8,11 +8,13 @@ use std::sync::{Arc, Mutex};
 
 type Storage = HashMap<String, String>;
 type ListStorage = HashMap<String, Vec<String>>;
+type HashStorage = HashMap<String, HashMap<String, String>>;
 
 #[derive(Serialize, Deserialize, Default, Encode, Decode)]
 struct KVStore {
     data: Storage,
     lists: ListStorage,
+    hashes: HashStorage,
     /// Expiration times per key: key -> absolute timestamp (seconds since epoch)
     #[serde(rename = "exp")]
     expiration: HashMap<String, u64>,
@@ -26,6 +28,7 @@ impl KVStore {
         Self {
             data: HashMap::new(),
             lists: HashMap::new(),
+            hashes: HashMap::new(),
             expiration: HashMap::new(),
             subscribers: HashMap::new(),
             next_sub_id: 1,
@@ -42,6 +45,7 @@ impl KVStore {
 
     fn set_with_ttl(&mut self, key: String, value: String, ttl: Option<u64>) {
         self.lists.remove(&key);
+        self.hashes.remove(&key);
         self.data.insert(key.clone(), value);
         if let Some(ttl_seconds) = ttl {
             let expiration = Self::now_seconds() + ttl_seconds;
@@ -57,6 +61,7 @@ impl KVStore {
             if now >= *expiration {
                 self.data.remove(key);
                 self.lists.remove(key);
+                self.hashes.remove(key);
                 self.expiration.remove(key);
                 return true;
             }
@@ -73,16 +78,30 @@ impl KVStore {
 
     fn del(&mut self, key: &str) -> bool {
         self.expiration.remove(key);
-        self.data.remove(key).is_some() || self.lists.remove(key).is_some()
+        self.data.remove(key).is_some()
+            || self.lists.remove(key).is_some()
+            || self.hashes.remove(key).is_some()
     }
 
     fn keys(&mut self) -> Vec<String> {
-        let all_keys: Vec<String> = self.data.keys().chain(self.lists.keys()).cloned().collect();
+        let all_keys: Vec<String> = self
+            .data
+            .keys()
+            .chain(self.lists.keys())
+            .chain(self.hashes.keys())
+            .cloned()
+            .collect();
         for key in &all_keys {
             self.get(key);
         }
 
-        let mut keys: Vec<String> = self.data.keys().chain(self.lists.keys()).cloned().collect();
+        let mut keys: Vec<String> = self
+            .data
+            .keys()
+            .chain(self.lists.keys())
+            .chain(self.hashes.keys())
+            .cloned()
+            .collect();
         keys.sort();
         keys.dedup();
         keys
@@ -160,7 +179,10 @@ impl KVStore {
             } else {
                 None
             }
-        } else if self.data.contains_key(key) || self.lists.contains_key(key) {
+        } else if self.data.contains_key(key)
+            || self.lists.contains_key(key)
+            || self.hashes.contains_key(key)
+        {
             Some(-1)
         } else {
             None
@@ -168,7 +190,10 @@ impl KVStore {
     }
 
     fn expire(&mut self, key: &str, ttl_seconds: u64) -> bool {
-        if self.data.contains_key(key) || self.lists.contains_key(key) {
+        if self.data.contains_key(key)
+            || self.lists.contains_key(key)
+            || self.hashes.contains_key(key)
+        {
             let expiration = Self::now_seconds() + ttl_seconds;
             self.expiration.insert(key.to_string(), expiration);
             true
@@ -181,10 +206,12 @@ impl KVStore {
         if self.expiration.remove(key).is_some() {
             true
         } else {
-            self.data.contains_key(key) || self.lists.contains_key(key)
+            self.data.contains_key(key)
+                || self.lists.contains_key(key)
+                || self.hashes.contains_key(key)
+                || self.hashes.contains_key(key)
         }
     }
-
 
     fn exists_key(&mut self, key: &str) -> bool {
         if self.evict_if_expired(key) {
@@ -222,6 +249,7 @@ impl KVStore {
 
     fn rpush(&mut self, key: &str, values: &[String]) -> usize {
         self.data.remove(key);
+        self.hashes.remove(key);
         let list = self.lists.entry(key.to_string()).or_default();
         list.extend(values.iter().cloned());
         list.len()
@@ -229,6 +257,7 @@ impl KVStore {
 
     fn lpush(&mut self, key: &str, values: &[String]) -> usize {
         self.data.remove(key);
+        self.hashes.remove(key);
         let list = self.lists.entry(key.to_string()).or_default();
         for value in values {
             list.insert(0, value.clone());
@@ -272,6 +301,113 @@ impl KVStore {
         }
         self.lists.get(key).map(Vec::len)
     }
+
+    fn hset(&mut self, key: &str, items: &[(String, String)]) -> usize {
+        self.data.remove(key);
+        self.lists.remove(key);
+        let hash = self.hashes.entry(key.to_string()).or_default();
+        let mut new_fields = 0;
+        for (field, value) in items {
+            if hash.insert(field.clone(), value.clone()).is_none() {
+                new_fields += 1;
+            }
+        }
+        new_fields
+    }
+
+    fn hget(&mut self, key: &str, field: &str) -> Option<String> {
+        if self.evict_if_expired(key) {
+            return None;
+        }
+        self.hashes.get(key).and_then(|h| h.get(field).cloned())
+    }
+
+    fn hmget(&mut self, key: &str, fields: &[String]) -> Vec<Option<String>> {
+        if self.evict_if_expired(key) {
+            return fields.iter().map(|_| None).collect();
+        }
+        let hash = match self.hashes.get(key) {
+            Some(h) => h,
+            None => return fields.iter().map(|_| None).collect(),
+        };
+        fields.iter().map(|f| hash.get(f).cloned()).collect()
+    }
+
+    fn hdel(&mut self, key: &str, fields: &[String]) -> usize {
+        if self.evict_if_expired(key) {
+            return 0;
+        }
+        let mut removed = 0;
+        let mut remove_key = false;
+        if let Some(hash) = self.hashes.get_mut(key) {
+            for field in fields {
+                if hash.remove(field).is_some() {
+                    removed += 1;
+                }
+            }
+            if hash.is_empty() {
+                remove_key = true;
+            }
+        }
+        if remove_key {
+            self.hashes.remove(key);
+            self.expiration.remove(key);
+        }
+        removed
+    }
+
+    fn hexists(&mut self, key: &str, field: &str) -> bool {
+        if self.evict_if_expired(key) {
+            return false;
+        }
+        self.hashes.get(key).is_some_and(|h| h.contains_key(field))
+    }
+
+    fn hlen(&mut self, key: &str) -> usize {
+        if self.evict_if_expired(key) {
+            return 0;
+        }
+        self.hashes.get(key).map(|h| h.len()).unwrap_or(0)
+    }
+
+    fn hkeys(&mut self, key: &str) -> Vec<String> {
+        if self.evict_if_expired(key) {
+            return vec![];
+        }
+        let mut out: Vec<String> = self
+            .hashes
+            .get(key)
+            .map(|h| h.keys().cloned().collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    fn hvals(&mut self, key: &str) -> Vec<String> {
+        if self.evict_if_expired(key) {
+            return vec![];
+        }
+        let mut entries: Vec<(String, String)> = self
+            .hashes
+            .get(key)
+            .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.into_iter().map(|(_, v)| v).collect()
+    }
+
+    fn hgetall(&mut self, key: &str) -> Vec<(String, String)> {
+        if self.evict_if_expired(key) {
+            return vec![];
+        }
+        let mut entries: Vec<(String, String)> = self
+            .hashes
+            .get(key)
+            .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
 }
 
 fn main() {
@@ -303,7 +439,7 @@ fn main() {
 
     println!("KV Storage (Redis-like) - Basic Edition");
     println!(
-        "Commands: GET <key>, SET <key> <value> [TTL], SETNX <key> <value>, SETEX <key> <seconds> <value>, MSET <k1> <v1> [k2 v2...], MSETNX <k1> <v1> [k2 v2...], DEL <key>, KEYS, SUBSCRIBE <channel>, PUBLISH <channel> <message>, UNSUBSCRIBE <channel> <sub_id>, TTL <key>, EXPIRE <key> <seconds>, PERSISTKEY <key>, PERSIST <path>, RPUSH <key> <v1> [v2...], LPUSH <key> <v1> [v2...], LRANGE <key> <start> <stop>, LLEN <key>, QUIT"
+        "Commands: GET <key>, SET <key> <value> [TTL], SETNX <key> <value>, SETEX <key> <seconds> <value>, MSET <k1> <v1> [k2 v2...], MSETNX <k1> <v1> [k2 v2...], DEL <key>, KEYS, SUBSCRIBE <channel>, PUBLISH <channel> <message>, UNSUBSCRIBE <channel> <sub_id>, TTL <key>, EXPIRE <key> <seconds>, PERSISTKEY <key>, PERSIST <path>, RPUSH <key> <v1> [v2...], LPUSH <key> <v1> [v2...], LRANGE <key> <start> <stop>, LLEN <key>, HSET <key> <field> <value> [field value...], HMSET <key> <field> <value> [field value...], HGET <key> <field>, HMGET <key> <field> [field...], HDEL <key> <field> [field...], HEXISTS <key> <field>, HLEN <key>, HKEYS <key>, HVALS <key>, HGETALL <key>, QUIT"
     );
 
     for line in stdin.lock().lines() {
@@ -407,18 +543,28 @@ fn main() {
             }
             "MSET" | "MSETNX" => {
                 if parts.len() < 2 {
-                    writeln!(stdout_lock, "Error: {} requires <k1> <v1> [k2 v2...]", command).unwrap();
+                    writeln!(
+                        stdout_lock,
+                        "Error: {} requires <k1> <v1> [k2 v2...]",
+                        command
+                    )
+                    .unwrap();
                     continue;
                 }
                 let tokens: Vec<&str> = parts[1].split_whitespace().collect();
                 if tokens.len() < 2 || tokens.len() % 2 != 0 {
-                    writeln!(stdout_lock, "Error: {} requires even number of key/value args", command).unwrap();
+                    writeln!(
+                        stdout_lock,
+                        "Error: {} requires even number of key/value args",
+                        command
+                    )
+                    .unwrap();
                     continue;
                 }
-                let mut kvs: Vec<(String,String)> = Vec::new();
+                let mut kvs: Vec<(String, String)> = Vec::new();
                 let mut i = 0;
                 while i < tokens.len() {
-                    kvs.push((tokens[i].to_string(), tokens[i+1].to_string()));
+                    kvs.push((tokens[i].to_string(), tokens[i + 1].to_string()));
                     i += 2;
                 }
                 let mut storage = storage.lock().unwrap();
@@ -687,6 +833,188 @@ fn main() {
                     None => writeln!(stdout_lock, "(integer) 0").unwrap(),
                 }
             }
+            "HSET" | "HMSET" => {
+                if parts.len() < 2 {
+                    writeln!(
+                        stdout_lock,
+                        "Error: {} requires <key> <field> <value> [field value...]",
+                        command
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() < 3 || tokens.len() % 2 == 0 {
+                    writeln!(
+                        stdout_lock,
+                        "Error: {} requires <key> <field> <value> [field value...]",
+                        command
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let key = tokens[0];
+                let mut items: Vec<(String, String)> = Vec::new();
+                let mut i = 1;
+                while i < tokens.len() {
+                    items.push((tokens[i].to_string(), tokens[i + 1].to_string()));
+                    i += 2;
+                }
+                let mut storage = storage.lock().unwrap();
+                let added = storage.hset(key, &items);
+                if storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+                if command == "HSET" {
+                    writeln!(stdout_lock, "(integer) {}", added).unwrap();
+                } else {
+                    writeln!(stdout_lock, "OK").unwrap();
+                }
+            }
+            "HGET" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: HGET requires <key> <field>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 2 {
+                    writeln!(stdout_lock, "Error: HGET requires <key> <field>").unwrap();
+                    continue;
+                }
+                let mut storage = storage.lock().unwrap();
+                match storage.hget(tokens[0], tokens[1]) {
+                    Some(value) => writeln!(stdout_lock, "{}", value).unwrap(),
+                    None => writeln!(stdout_lock, "(nil)").unwrap(),
+                }
+            }
+            "HMGET" => {
+                if parts.len() < 2 {
+                    writeln!(
+                        stdout_lock,
+                        "Error: HMGET requires <key> <field> [field...]"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() < 2 {
+                    writeln!(
+                        stdout_lock,
+                        "Error: HMGET requires <key> <field> [field...]"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let key = tokens[0];
+                let fields: Vec<String> = tokens[1..].iter().map(|s| (*s).to_string()).collect();
+                let mut storage = storage.lock().unwrap();
+                let values = storage.hmget(key, &fields);
+                for value in values {
+                    match value {
+                        Some(v) => writeln!(stdout_lock, "- {}", v).unwrap(),
+                        None => writeln!(stdout_lock, "(nil)").unwrap(),
+                    }
+                }
+            }
+            "HDEL" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: HDEL requires <key> <field> [field...]").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() < 2 {
+                    writeln!(stdout_lock, "Error: HDEL requires <key> <field> [field...]").unwrap();
+                    continue;
+                }
+                let key = tokens[0];
+                let fields: Vec<String> = tokens[1..].iter().map(|s| (*s).to_string()).collect();
+                let mut storage = storage.lock().unwrap();
+                let removed = storage.hdel(key, &fields);
+                if removed > 0 && storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+                writeln!(stdout_lock, "(integer) {}", removed).unwrap();
+            }
+            "HEXISTS" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: HEXISTS requires <key> <field>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 2 {
+                    writeln!(stdout_lock, "Error: HEXISTS requires <key> <field>").unwrap();
+                    continue;
+                }
+                let mut storage = storage.lock().unwrap();
+                writeln!(
+                    stdout_lock,
+                    "(integer) {}",
+                    if storage.hexists(tokens[0], tokens[1]) {
+                        1
+                    } else {
+                        0
+                    }
+                )
+                .unwrap();
+            }
+            "HLEN" => {
+                if parts.len() < 2 || parts[1].is_empty() {
+                    writeln!(stdout_lock, "Error: HLEN requires a key").unwrap();
+                    continue;
+                }
+                let key = parts[1].trim();
+                let mut storage = storage.lock().unwrap();
+                writeln!(stdout_lock, "(integer) {}", storage.hlen(key)).unwrap();
+            }
+            "HKEYS" => {
+                if parts.len() < 2 || parts[1].is_empty() {
+                    writeln!(stdout_lock, "Error: HKEYS requires a key").unwrap();
+                    continue;
+                }
+                let key = parts[1].trim();
+                let mut storage = storage.lock().unwrap();
+                let fields = storage.hkeys(key);
+                if fields.is_empty() {
+                    writeln!(stdout_lock, "(empty array)").unwrap();
+                } else {
+                    for field in fields {
+                        writeln!(stdout_lock, "- {}", field).unwrap();
+                    }
+                }
+            }
+            "HVALS" => {
+                if parts.len() < 2 || parts[1].is_empty() {
+                    writeln!(stdout_lock, "Error: HVALS requires a key").unwrap();
+                    continue;
+                }
+                let key = parts[1].trim();
+                let mut storage = storage.lock().unwrap();
+                let values = storage.hvals(key);
+                if values.is_empty() {
+                    writeln!(stdout_lock, "(empty array)").unwrap();
+                } else {
+                    for value in values {
+                        writeln!(stdout_lock, "- {}", value).unwrap();
+                    }
+                }
+            }
+            "HGETALL" => {
+                if parts.len() < 2 || parts[1].is_empty() {
+                    writeln!(stdout_lock, "Error: HGETALL requires a key").unwrap();
+                    continue;
+                }
+                let key = parts[1].trim();
+                let mut storage = storage.lock().unwrap();
+                let entries = storage.hgetall(key);
+                if entries.is_empty() {
+                    writeln!(stdout_lock, "(empty array)").unwrap();
+                } else {
+                    for (field, value) in entries {
+                        writeln!(stdout_lock, "- {}", field).unwrap();
+                        writeln!(stdout_lock, "- {}", value).unwrap();
+                    }
+                }
+            }
             "QUIT" => {
                 writeln!(stdout_lock, "Goodbye!").unwrap();
                 break;
@@ -697,7 +1025,6 @@ fn main() {
         }
         stdout_lock.flush().unwrap();
     }
-
 }
 
 #[cfg(test)]
@@ -733,7 +1060,6 @@ mod tests {
         assert_eq!(store.lrange("l", 0, -1), None);
     }
 
-
     #[test]
     fn setnx_only_sets_when_missing() {
         let mut store = KVStore::new();
@@ -761,5 +1087,59 @@ mod tests {
         store.setex("k".to_string(), "v".to_string(), 2);
         assert_eq!(store.get("k"), Some(&"v".to_string()));
         assert!(store.ttl("k").map(|t| t > 0).unwrap_or(false));
+    }
+
+    #[test]
+    fn hset_and_hget_work() {
+        let mut store = KVStore::new();
+        let pairs = vec![
+            ("f1".to_string(), "v1".to_string()),
+            ("f2".to_string(), "v2".to_string()),
+        ];
+        assert_eq!(store.hset("h", &pairs), 2);
+        assert_eq!(store.hget("h", "f1"), Some("v1".to_string()));
+        assert_eq!(store.hget("h", "missing"), None);
+    }
+
+    #[test]
+    fn hset_counts_only_new_fields() {
+        let mut store = KVStore::new();
+        let a = vec![("f".to_string(), "1".to_string())];
+        let b = vec![
+            ("f".to_string(), "2".to_string()),
+            ("g".to_string(), "3".to_string()),
+        ];
+        assert_eq!(store.hset("h", &a), 1);
+        assert_eq!(store.hset("h", &b), 1);
+        assert_eq!(store.hget("h", "f"), Some("2".to_string()));
+    }
+
+    #[test]
+    fn hdel_hexists_hlen_and_hmget_work() {
+        let mut store = KVStore::new();
+        let pairs = vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ];
+        store.hset("h", &pairs);
+        assert!(store.hexists("h", "a"));
+        assert_eq!(store.hlen("h"), 2);
+        let vals = store.hmget("h", &["a".to_string(), "x".to_string(), "b".to_string()]);
+        assert_eq!(
+            vals,
+            vec![Some("1".to_string()), None, Some("2".to_string())]
+        );
+        assert_eq!(store.hdel("h", &["a".to_string(), "x".to_string()]), 1);
+        assert_eq!(store.hlen("h"), 1);
+    }
+
+    #[test]
+    fn hash_reads_reflect_immediate_expiration_without_get() {
+        let mut store = KVStore::new();
+        store.hset("h", &[("a".to_string(), "1".to_string())]);
+        assert!(store.expire("h", 0));
+
+        assert_eq!(store.hlen("h"), 0);
+        assert_eq!(store.hget("h", "a"), None);
     }
 }
