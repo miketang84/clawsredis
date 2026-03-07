@@ -185,6 +185,41 @@ impl KVStore {
         }
     }
 
+
+    fn exists_key(&mut self, key: &str) -> bool {
+        if self.evict_if_expired(key) {
+            return false;
+        }
+        self.data.contains_key(key) || self.lists.contains_key(key)
+    }
+
+    fn setnx(&mut self, key: String, value: String) -> bool {
+        if self.exists_key(&key) {
+            false
+        } else {
+            self.set_with_ttl(key, value, None);
+            true
+        }
+    }
+
+    fn setex(&mut self, key: String, value: String, ttl_seconds: u64) {
+        self.set_with_ttl(key, value, Some(ttl_seconds));
+    }
+
+    fn mset(&mut self, items: &[(String, String)]) {
+        for (k, v) in items {
+            self.set_with_ttl(k.clone(), v.clone(), None);
+        }
+    }
+
+    fn msetnx(&mut self, items: &[(String, String)]) -> bool {
+        if items.iter().any(|(k, _)| self.exists_key(k)) {
+            return false;
+        }
+        self.mset(items);
+        true
+    }
+
     fn rpush(&mut self, key: &str, values: &[String]) -> usize {
         self.data.remove(key);
         let list = self.lists.entry(key.to_string()).or_default();
@@ -268,7 +303,7 @@ fn main() {
 
     println!("KV Storage (Redis-like) - Basic Edition");
     println!(
-        "Commands: GET <key>, SET <key> <value> [TTL], DEL <key>, KEYS, SUBSCRIBE <channel>, PUBLISH <channel> <message>, UNSUBSCRIBE <channel> <sub_id>, TTL <key>, EXPIRE <key> <seconds>, PERSISTKEY <key>, PERSIST <path>, RPUSH <key> <v1> [v2...], LPUSH <key> <v1> [v2...], LRANGE <key> <start> <stop>, LLEN <key>, QUIT"
+        "Commands: GET <key>, SET <key> <value> [TTL], SETNX <key> <value>, SETEX <key> <seconds> <value>, MSET <k1> <v1> [k2 v2...], MSETNX <k1> <v1> [k2 v2...], DEL <key>, KEYS, SUBSCRIBE <channel>, PUBLISH <channel> <message>, UNSUBSCRIBE <channel> <sub_id>, TTL <key>, EXPIRE <key> <seconds>, PERSISTKEY <key>, PERSIST <path>, RPUSH <key> <v1> [v2...], LPUSH <key> <v1> [v2...], LRANGE <key> <start> <stop>, LLEN <key>, QUIT"
     );
 
     for line in stdin.lock().lines() {
@@ -328,6 +363,78 @@ fn main() {
                     writeln!(stdout_lock, "Warning: Persist failed").unwrap();
                 }
                 writeln!(stdout_lock, "OK").unwrap();
+            }
+            "SETNX" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: SETNX requires <key> <value>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 2 {
+                    writeln!(stdout_lock, "Error: SETNX requires <key> <value>").unwrap();
+                    continue;
+                }
+                let mut storage = storage.lock().unwrap();
+                let inserted = storage.setnx(tokens[0].to_string(), tokens[1].to_string());
+                if inserted && storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+                writeln!(stdout_lock, "(integer) {}", if inserted { 1 } else { 0 }).unwrap();
+            }
+            "SETEX" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: SETEX requires <key> <seconds> <value>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 3 {
+                    writeln!(stdout_lock, "Error: SETEX requires <key> <seconds> <value>").unwrap();
+                    continue;
+                }
+                let ttl: u64 = match tokens[1].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        writeln!(stdout_lock, "Error: Invalid TTL value").unwrap();
+                        continue;
+                    }
+                };
+                let mut storage = storage.lock().unwrap();
+                storage.setex(tokens[0].to_string(), tokens[2].to_string(), ttl);
+                if storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+                writeln!(stdout_lock, "OK").unwrap();
+            }
+            "MSET" | "MSETNX" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: {} requires <k1> <v1> [k2 v2...]", command).unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() < 2 || tokens.len() % 2 != 0 {
+                    writeln!(stdout_lock, "Error: {} requires even number of key/value args", command).unwrap();
+                    continue;
+                }
+                let mut kvs: Vec<(String,String)> = Vec::new();
+                let mut i = 0;
+                while i < tokens.len() {
+                    kvs.push((tokens[i].to_string(), tokens[i+1].to_string()));
+                    i += 2;
+                }
+                let mut storage = storage.lock().unwrap();
+                if command == "MSET" {
+                    storage.mset(&kvs);
+                    if storage.maybe_persist().is_err() {
+                        writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                    }
+                    writeln!(stdout_lock, "OK").unwrap();
+                } else {
+                    let inserted = storage.msetnx(&kvs);
+                    if inserted && storage.maybe_persist().is_err() {
+                        writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                    }
+                    writeln!(stdout_lock, "(integer) {}", if inserted { 1 } else { 0 }).unwrap();
+                }
             }
             "DEL" => {
                 if parts.len() < 2 || parts[1].is_empty() {
@@ -590,6 +697,7 @@ fn main() {
         }
         stdout_lock.flush().unwrap();
     }
+
 }
 
 #[cfg(test)]
@@ -623,5 +731,35 @@ mod tests {
 
         assert_eq!(store.llen("l"), None);
         assert_eq!(store.lrange("l", 0, -1), None);
+    }
+
+
+    #[test]
+    fn setnx_only_sets_when_missing() {
+        let mut store = KVStore::new();
+        assert!(store.setnx("k".to_string(), "v1".to_string()));
+        assert!(!store.setnx("k".to_string(), "v2".to_string()));
+        assert_eq!(store.get("k"), Some(&"v1".to_string()));
+    }
+
+    #[test]
+    fn msetnx_is_atomic() {
+        let mut store = KVStore::new();
+        store.set_with_ttl("a".to_string(), "1".to_string(), None);
+        let pairs = vec![
+            ("a".to_string(), "x".to_string()),
+            ("b".to_string(), "y".to_string()),
+        ];
+        assert!(!store.msetnx(&pairs));
+        assert_eq!(store.get("a"), Some(&"1".to_string()));
+        assert_eq!(store.get("b"), None);
+    }
+
+    #[test]
+    fn setex_sets_value_with_ttl() {
+        let mut store = KVStore::new();
+        store.setex("k".to_string(), "v".to_string(), 2);
+        assert_eq!(store.get("k"), Some(&"v".to_string()));
+        assert!(store.ttl("k").map(|t| t > 0).unwrap_or(false));
     }
 }
