@@ -34,7 +34,10 @@ impl KVStore {
     }
 
     fn now_seconds() -> u64 {
-        std::time::Instant::now().elapsed().as_secs()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is before UNIX_EPOCH")
+            .as_secs()
     }
 
     fn set_with_ttl(&mut self, key: String, value: String, ttl: Option<u64>) {
@@ -588,7 +591,6 @@ fn main() {
         stdout_lock.flush().unwrap();
     }
 }
-
 
 #[cfg(test)]
 mod tests {
