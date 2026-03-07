@@ -209,7 +209,6 @@ impl KVStore {
             self.data.contains_key(key)
                 || self.lists.contains_key(key)
                 || self.hashes.contains_key(key)
-                || self.hashes.contains_key(key)
         }
     }
 
@@ -217,7 +216,9 @@ impl KVStore {
         if self.evict_if_expired(key) {
             return false;
         }
-        self.data.contains_key(key) || self.lists.contains_key(key)
+        self.data.contains_key(key)
+            || self.lists.contains_key(key)
+            || self.hashes.contains_key(key)
     }
 
     fn setnx(&mut self, key: String, value: String) -> bool {
@@ -1069,6 +1070,16 @@ mod tests {
     }
 
     #[test]
+    fn setnx_does_not_overwrite_existing_hash_key() {
+        let mut store = KVStore::new();
+        store.hset("k", &[("f".to_string(), "v".to_string())]);
+
+        assert!(!store.setnx("k".to_string(), "string".to_string()));
+        assert_eq!(store.hget("k", "f"), Some("v".to_string()));
+        assert_eq!(store.get("k"), None);
+    }
+
+    #[test]
     fn msetnx_is_atomic() {
         let mut store = KVStore::new();
         store.set_with_ttl("a".to_string(), "1".to_string(), None);
@@ -1079,6 +1090,21 @@ mod tests {
         assert!(!store.msetnx(&pairs));
         assert_eq!(store.get("a"), Some(&"1".to_string()));
         assert_eq!(store.get("b"), None);
+    }
+
+    #[test]
+    fn msetnx_fails_if_any_target_key_is_a_hash() {
+        let mut store = KVStore::new();
+        store.hset("h", &[("f".to_string(), "1".to_string())]);
+
+        let pairs = vec![
+            ("h".to_string(), "x".to_string()),
+            ("other".to_string(), "y".to_string()),
+        ];
+
+        assert!(!store.msetnx(&pairs));
+        assert_eq!(store.hget("h", "f"), Some("1".to_string()));
+        assert_eq!(store.get("other"), None);
     }
 
     #[test]
