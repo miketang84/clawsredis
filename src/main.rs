@@ -216,9 +216,7 @@ impl KVStore {
         if self.evict_if_expired(key) {
             return false;
         }
-        self.data.contains_key(key)
-            || self.lists.contains_key(key)
-            || self.hashes.contains_key(key)
+        self.data.contains_key(key) || self.lists.contains_key(key) || self.hashes.contains_key(key)
     }
 
     fn setnx(&mut self, key: String, value: String) -> bool {
@@ -232,6 +230,52 @@ impl KVStore {
 
     fn setex(&mut self, key: String, value: String, ttl_seconds: u64) {
         self.set_with_ttl(key, value, Some(ttl_seconds));
+    }
+
+    fn mget(&mut self, keys: &[String]) -> Vec<Option<String>> {
+        keys.iter().map(|k| self.get(k).cloned()).collect()
+    }
+
+    fn is_non_string_key(&mut self, key: &str) -> bool {
+        if self.evict_if_expired(key) {
+            return false;
+        }
+        self.lists.contains_key(key) || self.hashes.contains_key(key)
+    }
+
+    fn append(&mut self, key: String, suffix: String) -> usize {
+        if let Some(existing) = self.data.get_mut(&key) {
+            existing.push_str(&suffix);
+            existing.len()
+        } else {
+            self.set_with_ttl(key, suffix.clone(), None);
+            suffix.len()
+        }
+    }
+
+    fn strlen(&mut self, key: &str) -> usize {
+        self.get(key).map(|v| v.len()).unwrap_or(0)
+    }
+
+    fn getset(&mut self, key: String, value: String) -> Option<String> {
+        let previous = self.get(&key).cloned();
+        self.set_with_ttl(key, value, None);
+        previous
+    }
+
+    fn incrby(&mut self, key: String, delta: i64) -> Result<i64, &'static str> {
+        let current = match self.get(&key) {
+            Some(v) => v
+                .parse::<i64>()
+                .map_err(|_| "Error: value is not an integer")?,
+            None => 0,
+        };
+
+        let next = current
+            .checked_add(delta)
+            .ok_or("Error: increment or decrement would overflow")?;
+        self.set_with_ttl(key, next.to_string(), None);
+        Ok(next)
     }
 
     fn mset(&mut self, items: &[(String, String)]) {
@@ -440,7 +484,7 @@ fn main() {
 
     println!("KV Storage (Redis-like) - Basic Edition");
     println!(
-        "Commands: GET <key>, SET <key> <value> [TTL], SETNX <key> <value>, SETEX <key> <seconds> <value>, MSET <k1> <v1> [k2 v2...], MSETNX <k1> <v1> [k2 v2...], DEL <key>, KEYS, SUBSCRIBE <channel>, PUBLISH <channel> <message>, UNSUBSCRIBE <channel> <sub_id>, TTL <key>, EXPIRE <key> <seconds>, PERSISTKEY <key>, PERSIST <path>, RPUSH <key> <v1> [v2...], LPUSH <key> <v1> [v2...], LRANGE <key> <start> <stop>, LLEN <key>, HSET <key> <field> <value> [field value...], HMSET <key> <field> <value> [field value...], HGET <key> <field>, HMGET <key> <field> [field...], HDEL <key> <field> [field...], HEXISTS <key> <field>, HLEN <key>, HKEYS <key>, HVALS <key>, HGETALL <key>, QUIT"
+        "Commands: GET <key>, SET <key> <value> [TTL], SETNX <key> <value>, SETEX <key> <seconds> <value>, MSET <k1> <v1> [k2 v2...], MSETNX <k1> <v1> [k2 v2...], MGET <k1> [k2...], APPEND <key> <value>, STRLEN <key>, GETSET <key> <value>, INCR <key>, DECR <key>, INCRBY <key> <n>, DECRBY <key> <n>, DEL <key>, KEYS, SUBSCRIBE <channel>, PUBLISH <channel> <message>, UNSUBSCRIBE <channel> <sub_id>, TTL <key>, EXPIRE <key> <seconds>, PERSISTKEY <key>, PERSIST <path>, RPUSH <key> <v1> [v2...], LPUSH <key> <v1> [v2...], LRANGE <key> <start> <stop>, LLEN <key>, HSET <key> <field> <value> [field value...], HMSET <key> <field> <value> [field value...], HGET <key> <field>, HMGET <key> <field> [field...], HDEL <key> <field> [field...], HEXISTS <key> <field>, HLEN <key>, HKEYS <key>, HVALS <key>, HGETALL <key>, QUIT"
     );
 
     for line in stdin.lock().lines() {
@@ -581,6 +625,151 @@ fn main() {
                         writeln!(stdout_lock, "Warning: Persist failed").unwrap();
                     }
                     writeln!(stdout_lock, "(integer) {}", if inserted { 1 } else { 0 }).unwrap();
+                }
+            }
+            "MGET" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: MGET requires <k1> [k2...]").unwrap();
+                    continue;
+                }
+                let keys: Vec<String> =
+                    parts[1].split_whitespace().map(|s| s.to_string()).collect();
+                if keys.is_empty() {
+                    writeln!(stdout_lock, "Error: MGET requires <k1> [k2...]").unwrap();
+                    continue;
+                }
+
+                let mut storage = storage.lock().unwrap();
+                let values = storage.mget(&keys);
+                for value in values {
+                    match value {
+                        Some(v) => writeln!(stdout_lock, "- {}", v).unwrap(),
+                        None => writeln!(stdout_lock, "(nil)").unwrap(),
+                    }
+                }
+            }
+            "APPEND" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: APPEND requires <key> <value>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 2 {
+                    writeln!(stdout_lock, "Error: APPEND requires <key> <value>").unwrap();
+                    continue;
+                }
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_string_key(tokens[0]) {
+                    writeln!(
+                        stdout_lock,
+                        "Error: WRONGTYPE Operation against a key holding the wrong kind of value"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let len = storage.append(tokens[0].to_string(), tokens[1].to_string());
+                if storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+                writeln!(stdout_lock, "(integer) {}", len).unwrap();
+            }
+            "STRLEN" => {
+                if parts.len() < 2 || parts[1].is_empty() {
+                    writeln!(stdout_lock, "Error: STRLEN requires a key").unwrap();
+                    continue;
+                }
+                let key = parts[1].trim();
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_string_key(key) {
+                    writeln!(
+                        stdout_lock,
+                        "Error: WRONGTYPE Operation against a key holding the wrong kind of value"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                writeln!(stdout_lock, "(integer) {}", storage.strlen(key)).unwrap();
+            }
+            "GETSET" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: GETSET requires <key> <value>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 2 {
+                    writeln!(stdout_lock, "Error: GETSET requires <key> <value>").unwrap();
+                    continue;
+                }
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_string_key(tokens[0]) {
+                    writeln!(
+                        stdout_lock,
+                        "Error: WRONGTYPE Operation against a key holding the wrong kind of value"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                match storage.getset(tokens[0].to_string(), tokens[1].to_string()) {
+                    Some(v) => writeln!(stdout_lock, "{}", v).unwrap(),
+                    None => writeln!(stdout_lock, "(nil)").unwrap(),
+                }
+                if storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+            }
+            "INCR" | "DECR" | "INCRBY" | "DECRBY" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: {} requires arguments", command).unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                let (key, delta): (&str, i64) = match command.as_str() {
+                    "INCR" | "DECR" => {
+                        if tokens.len() != 1 {
+                            writeln!(stdout_lock, "Error: {} requires <key>", command).unwrap();
+                            continue;
+                        }
+                        (tokens[0], if command == "INCR" { 1 } else { -1 })
+                    }
+                    "INCRBY" | "DECRBY" => {
+                        if tokens.len() != 2 {
+                            writeln!(stdout_lock, "Error: {} requires <key> <n>", command).unwrap();
+                            continue;
+                        }
+                        let n: i64 = match tokens[1].parse() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                writeln!(
+                                    stdout_lock,
+                                    "Error: {} value must be an integer",
+                                    command
+                                )
+                                .unwrap();
+                                continue;
+                            }
+                        };
+                        (tokens[0], if command == "INCRBY" { n } else { -n })
+                    }
+                    _ => unreachable!(),
+                };
+
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_string_key(key) {
+                    writeln!(
+                        stdout_lock,
+                        "Error: WRONGTYPE Operation against a key holding the wrong kind of value"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                match storage.incrby(key.to_string(), delta) {
+                    Ok(v) => {
+                        if storage.maybe_persist().is_err() {
+                            writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                        }
+                        writeln!(stdout_lock, "(integer) {}", v).unwrap();
+                    }
+                    Err(msg) => writeln!(stdout_lock, "{}", msg).unwrap(),
                 }
             }
             "DEL" => {
@@ -1113,6 +1302,58 @@ mod tests {
         store.setex("k".to_string(), "v".to_string(), 2);
         assert_eq!(store.get("k"), Some(&"v".to_string()));
         assert!(store.ttl("k").map(|t| t > 0).unwrap_or(false));
+    }
+
+    #[test]
+    fn mget_returns_values_and_nil_for_missing() {
+        let mut store = KVStore::new();
+        store.set_with_ttl("a".to_string(), "1".to_string(), None);
+        store.set_with_ttl("b".to_string(), "2".to_string(), None);
+        let values = store.mget(&["a".to_string(), "x".to_string(), "b".to_string()]);
+        assert_eq!(
+            values,
+            vec![Some("1".to_string()), None, Some("2".to_string())]
+        );
+    }
+
+    #[test]
+    fn append_and_strlen_work() {
+        let mut store = KVStore::new();
+        assert_eq!(store.append("k".to_string(), "he".to_string()), 2);
+        assert_eq!(store.append("k".to_string(), "llo".to_string()), 5);
+        assert_eq!(store.get("k"), Some(&"hello".to_string()));
+        assert_eq!(store.strlen("k"), 5);
+        assert_eq!(store.strlen("missing"), 0);
+    }
+
+    #[test]
+    fn getset_returns_old_and_sets_new_value() {
+        let mut store = KVStore::new();
+        assert_eq!(store.getset("k".to_string(), "v1".to_string()), None);
+        assert_eq!(
+            store.getset("k".to_string(), "v2".to_string()),
+            Some("v1".to_string())
+        );
+        assert_eq!(store.get("k"), Some(&"v2".to_string()));
+    }
+
+    #[test]
+    fn incrby_and_decrby_work_for_missing_and_existing_keys() {
+        let mut store = KVStore::new();
+        assert_eq!(store.incrby("n".to_string(), 1), Ok(1));
+        assert_eq!(store.incrby("n".to_string(), 4), Ok(5));
+        assert_eq!(store.incrby("n".to_string(), -2), Ok(3));
+        assert_eq!(store.get("n"), Some(&"3".to_string()));
+    }
+
+    #[test]
+    fn incrby_rejects_non_integer_string() {
+        let mut store = KVStore::new();
+        store.set_with_ttl("n".to_string(), "abc".to_string(), None);
+        assert_eq!(
+            store.incrby("n".to_string(), 1),
+            Err("Error: value is not an integer")
+        );
     }
 
     #[test]
