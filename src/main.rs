@@ -48,15 +48,22 @@ impl KVStore {
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<&String> {
+    fn evict_if_expired(&mut self, key: &str) -> bool {
         if let Some(expiration) = self.expiration.get(key) {
             let now = Self::now_seconds();
             if now >= *expiration {
                 self.data.remove(key);
                 self.lists.remove(key);
                 self.expiration.remove(key);
-                return None;
+                return true;
             }
+        }
+        false
+    }
+
+    fn get(&mut self, key: &str) -> Option<&String> {
+        if self.evict_if_expired(key) {
+            return None;
         }
         self.data.get(key)
     }
@@ -191,7 +198,11 @@ impl KVStore {
         list.len()
     }
 
-    fn lrange(&self, key: &str, start: isize, stop: isize) -> Option<Vec<String>> {
+    fn lrange(&mut self, key: &str, start: isize, stop: isize) -> Option<Vec<String>> {
+        if self.evict_if_expired(key) {
+            return None;
+        }
+
         let list = self.lists.get(key)?;
         if list.is_empty() {
             return Some(vec![]);
@@ -201,9 +212,15 @@ impl KVStore {
         let mut s = if start < 0 { len + start } else { start };
         let mut e = if stop < 0 { len + stop } else { stop };
 
-        s = s.max(0).min(len - 1);
-        e = e.max(0).min(len - 1);
-
+        if s < 0 {
+            s = 0;
+        }
+        if e < 0 || s >= len {
+            return Some(vec![]);
+        }
+        if e >= len {
+            e = len - 1;
+        }
         if s > e {
             return Some(vec![]);
         }
@@ -211,7 +228,10 @@ impl KVStore {
         Some(list[s as usize..=e as usize].to_vec())
     }
 
-    fn llen(&self, key: &str) -> Option<usize> {
+    fn llen(&mut self, key: &str) -> Option<usize> {
+        if self.evict_if_expired(key) {
+            return None;
+        }
         self.lists.get(key).map(Vec::len)
     }
 }
@@ -532,7 +552,7 @@ fn main() {
                         continue;
                     }
                 };
-                let storage = storage.lock().unwrap();
+                let mut storage = storage.lock().unwrap();
                 match storage.lrange(key, start, stop) {
                     Some(values) if values.is_empty() => {
                         writeln!(stdout_lock, "(empty array)").unwrap()
@@ -551,7 +571,7 @@ fn main() {
                     continue;
                 }
                 let key = parts[1].trim();
-                let storage = storage.lock().unwrap();
+                let mut storage = storage.lock().unwrap();
                 match storage.llen(key) {
                     Some(len) => writeln!(stdout_lock, "(integer) {}", len).unwrap(),
                     None => writeln!(stdout_lock, "(integer) 0").unwrap(),
@@ -566,5 +586,40 @@ fn main() {
             }
         }
         stdout_lock.flush().unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lrange_out_of_bounds_start_returns_empty() {
+        let mut store = KVStore::new();
+        let values = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        store.rpush("mylist", &values);
+
+        assert_eq!(store.lrange("mylist", 100, 200), Some(vec![]));
+    }
+
+    #[test]
+    fn lrange_negative_stop_before_start_returns_empty() {
+        let mut store = KVStore::new();
+        let values = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        store.rpush("mylist", &values);
+
+        assert_eq!(store.lrange("mylist", 0, -100), Some(vec![]));
+    }
+
+    #[test]
+    fn list_reads_reflect_immediate_expiration_without_get() {
+        let mut store = KVStore::new();
+        let values = vec!["a".to_string(), "b".to_string()];
+        store.rpush("l", &values);
+        assert!(store.expire("l", 0));
+
+        assert_eq!(store.llen("l"), None);
+        assert_eq!(store.lrange("l", 0, -1), None);
     }
 }
