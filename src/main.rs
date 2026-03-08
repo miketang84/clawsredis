@@ -9,18 +9,21 @@ use std::sync::{Arc, Mutex};
 type Storage = HashMap<String, String>;
 type ListStorage = HashMap<String, Vec<String>>;
 type HashStorage = HashMap<String, HashMap<String, String>>;
+type SortedSetStorage = HashMap<String, HashMap<String, f64>>;
 
 #[derive(Serialize, Deserialize, Default, Encode, Decode)]
 struct KVStore {
     data: Storage,
     lists: ListStorage,
     hashes: HashStorage,
+    zsets: SortedSetStorage,
     /// Expiration times per key: key -> absolute timestamp (seconds since epoch)
     #[serde(rename = "exp")]
     expiration: HashMap<String, u64>,
     subscribers: HashMap<String, BTreeSet<usize>>,
     next_sub_id: usize,
     persist_path: Option<String>,
+
 }
 
 impl KVStore {
@@ -29,6 +32,7 @@ impl KVStore {
             data: HashMap::new(),
             lists: HashMap::new(),
             hashes: HashMap::new(),
+            zsets: HashMap::new(),
             expiration: HashMap::new(),
             subscribers: HashMap::new(),
             next_sub_id: 1,
@@ -46,6 +50,7 @@ impl KVStore {
     fn set_with_ttl(&mut self, key: String, value: String, ttl: Option<u64>) {
         self.lists.remove(&key);
         self.hashes.remove(&key);
+        self.zsets.remove(&key);
         self.data.insert(key.clone(), value);
         if let Some(ttl_seconds) = ttl {
             let expiration = Self::now_seconds() + ttl_seconds;
@@ -62,6 +67,7 @@ impl KVStore {
                 self.data.remove(key);
                 self.lists.remove(key);
                 self.hashes.remove(key);
+                self.zsets.remove(key);
                 self.expiration.remove(key);
                 return true;
             }
@@ -81,6 +87,7 @@ impl KVStore {
         self.data.remove(key).is_some()
             || self.lists.remove(key).is_some()
             || self.hashes.remove(key).is_some()
+            || self.zsets.remove(key).is_some()
     }
 
     fn keys(&mut self) -> Vec<String> {
@@ -89,6 +96,7 @@ impl KVStore {
             .keys()
             .chain(self.lists.keys())
             .chain(self.hashes.keys())
+            .chain(self.zsets.keys())
             .cloned()
             .collect();
         for key in &all_keys {
@@ -100,6 +108,7 @@ impl KVStore {
             .keys()
             .chain(self.lists.keys())
             .chain(self.hashes.keys())
+            .chain(self.zsets.keys())
             .cloned()
             .collect();
         keys.sort();
@@ -170,7 +179,7 @@ impl KVStore {
         }
     }
 
-    fn ttl(&self, key: &str) -> Option<i64> {
+    fn ttl(&mut self, key: &str) -> Option<i64> {
         if let Some(expiration) = self.expiration.get(key) {
             let now = Self::now_seconds();
             let remaining = *expiration as i64 - now as i64;
@@ -182,6 +191,7 @@ impl KVStore {
         } else if self.data.contains_key(key)
             || self.lists.contains_key(key)
             || self.hashes.contains_key(key)
+            || self.zsets.contains_key(key)
         {
             Some(-1)
         } else {
@@ -193,6 +203,7 @@ impl KVStore {
         if self.data.contains_key(key)
             || self.lists.contains_key(key)
             || self.hashes.contains_key(key)
+            || self.zsets.contains_key(key)
         {
             let expiration = Self::now_seconds() + ttl_seconds;
             self.expiration.insert(key.to_string(), expiration);
@@ -209,6 +220,7 @@ impl KVStore {
             self.data.contains_key(key)
                 || self.lists.contains_key(key)
                 || self.hashes.contains_key(key)
+                || self.zsets.contains_key(key)
         }
     }
 
@@ -216,7 +228,7 @@ impl KVStore {
         if self.evict_if_expired(key) {
             return false;
         }
-        self.data.contains_key(key) || self.lists.contains_key(key) || self.hashes.contains_key(key)
+        self.data.contains_key(key) || self.lists.contains_key(key) || self.hashes.contains_key(key) || self.zsets.contains_key(key)
     }
 
     fn setnx(&mut self, key: String, value: String) -> bool {
@@ -240,7 +252,14 @@ impl KVStore {
         if self.evict_if_expired(key) {
             return false;
         }
-        self.lists.contains_key(key) || self.hashes.contains_key(key)
+        self.lists.contains_key(key) || self.hashes.contains_key(key) || self.zsets.contains_key(key)
+    }
+
+    fn is_non_zset_key(&mut self, key: &str) -> bool {
+        if self.evict_if_expired(key) {
+            return false;
+        }
+        self.data.contains_key(key) || self.lists.contains_key(key) || self.hashes.contains_key(key)
     }
 
     fn append(&mut self, key: String, suffix: String) -> usize {
@@ -295,6 +314,7 @@ impl KVStore {
     fn rpush(&mut self, key: &str, values: &[String]) -> usize {
         self.data.remove(key);
         self.hashes.remove(key);
+        self.zsets.remove(key);
         let list = self.lists.entry(key.to_string()).or_default();
         list.extend(values.iter().cloned());
         list.len()
@@ -303,6 +323,7 @@ impl KVStore {
     fn lpush(&mut self, key: &str, values: &[String]) -> usize {
         self.data.remove(key);
         self.hashes.remove(key);
+        self.zsets.remove(key);
         let list = self.lists.entry(key.to_string()).or_default();
         for value in values {
             list.insert(0, value.clone());
@@ -350,6 +371,7 @@ impl KVStore {
     fn hset(&mut self, key: &str, items: &[(String, String)]) -> usize {
         self.data.remove(key);
         self.lists.remove(key);
+        self.zsets.remove(key);
         let hash = self.hashes.entry(key.to_string()).or_default();
         let mut new_fields = 0;
         for (field, value) in items {
@@ -453,6 +475,108 @@ impl KVStore {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
     }
+
+    fn zadd(&mut self, key: &str, entries: &[(f64, String)]) -> usize {
+        self.data.remove(key);
+        self.lists.remove(key);
+        self.hashes.remove(key);
+
+        let zset = self.zsets.entry(key.to_string()).or_default();
+        let mut added = 0;
+        for (score, member) in entries {
+            if zset.insert(member.clone(), *score).is_none() {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    fn zcard(&mut self, key: &str) -> usize {
+        if self.evict_if_expired(key) {
+            return 0;
+        }
+        self.zsets.get(key).map(|z| z.len()).unwrap_or(0)
+    }
+
+    fn zscore(&mut self, key: &str, member: &str) -> Option<f64> {
+        if self.evict_if_expired(key) {
+            return None;
+        }
+        self.zsets.get(key).and_then(|z| z.get(member).copied())
+    }
+
+    fn zrem(&mut self, key: &str, members: &[String]) -> usize {
+        if self.evict_if_expired(key) {
+            return 0;
+        }
+        let mut removed = 0;
+        let mut remove_key = false;
+        if let Some(zset) = self.zsets.get_mut(key) {
+            for member in members {
+                if zset.remove(member).is_some() {
+                    removed += 1;
+                }
+            }
+            if zset.is_empty() {
+                remove_key = true;
+            }
+        }
+        if remove_key {
+            self.zsets.remove(key);
+            self.expiration.remove(key);
+        }
+        removed
+    }
+
+    fn zrange(&mut self, key: &str, start: isize, stop: isize) -> Option<Vec<String>> {
+        if self.evict_if_expired(key) {
+            return None;
+        }
+
+        let zset = self.zsets.get(key)?;
+        if zset.is_empty() {
+            return Some(vec![]);
+        }
+
+        let mut entries: Vec<(String, f64)> = zset.iter().map(|(m, s)| (m.clone(), *s)).collect();
+        entries.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let len = entries.len() as isize;
+        let mut s = if start < 0 { len + start } else { start };
+        let mut e = if stop < 0 { len + stop } else { stop };
+
+        if s < 0 {
+            s = 0;
+        }
+        if e < 0 || s >= len {
+            return Some(vec![]);
+        }
+        if e >= len {
+            e = len - 1;
+        }
+        if s > e {
+            return Some(vec![]);
+        }
+
+        Some(
+            entries[s as usize..=e as usize]
+                .iter()
+                .map(|(member, _)| member.clone())
+                .collect(),
+        )
+    }
+
+    fn zincrby(&mut self, key: &str, increment: f64, member: String) -> f64 {
+        self.data.remove(key);
+        self.lists.remove(key);
+        self.hashes.remove(key);
+
+        let zset = self.zsets.entry(key.to_string()).or_default();
+        let next = zset.get(&member).copied().unwrap_or(0.0) + increment;
+        zset.insert(member, next);
+        next
+    }
+
 }
 
 fn main() {
@@ -484,7 +608,7 @@ fn main() {
 
     println!("KV Storage (Redis-like) - Basic Edition");
     println!(
-        "Commands: GET <key>, SET <key> <value> [TTL], SETNX <key> <value>, SETEX <key> <seconds> <value>, MSET <k1> <v1> [k2 v2...], MSETNX <k1> <v1> [k2 v2...], MGET <k1> [k2...], APPEND <key> <value>, STRLEN <key>, GETSET <key> <value>, INCR <key>, DECR <key>, INCRBY <key> <n>, DECRBY <key> <n>, DEL <key>, KEYS, SUBSCRIBE <channel>, PUBLISH <channel> <message>, UNSUBSCRIBE <channel> <sub_id>, TTL <key>, EXPIRE <key> <seconds>, PERSISTKEY <key>, PERSIST <path>, RPUSH <key> <v1> [v2...], LPUSH <key> <v1> [v2...], LRANGE <key> <start> <stop>, LLEN <key>, HSET <key> <field> <value> [field value...], HMSET <key> <field> <value> [field value...], HGET <key> <field>, HMGET <key> <field> [field...], HDEL <key> <field> [field...], HEXISTS <key> <field>, HLEN <key>, HKEYS <key>, HVALS <key>, HGETALL <key>, QUIT"
+        "Commands: GET <key>, SET <key> <value> [TTL], SETNX <key> <value>, SETEX <key> <seconds> <value>, MSET <k1> <v1> [k2 v2...], MSETNX <k1> <v1> [k2 v2...], MGET <k1> [k2...], APPEND <key> <value>, STRLEN <key>, GETSET <key> <value>, INCR <key>, DECR <key>, INCRBY <key> <n>, DECRBY <key> <n>, DEL <key>, KEYS, SUBSCRIBE <channel>, PUBLISH <channel> <message>, UNSUBSCRIBE <channel> <sub_id>, TTL <key>, EXPIRE <key> <seconds>, PERSISTKEY <key>, PERSIST <path>, RPUSH <key> <v1> [v2...], LPUSH <key> <v1> [v2...], LRANGE <key> <start> <stop>, LLEN <key>, HSET <key> <field> <value> [field value...], HMSET <key> <field> <value> [field value...], HGET <key> <field>, HMGET <key> <field> [field...], HDEL <key> <field> [field...], HEXISTS <key> <field>, HLEN <key>, HKEYS <key>, HVALS <key>, HGETALL <key>, ZADD <key> <score> <member> [score member...], ZCARD <key>, ZSCORE <key> <member>, ZREM <key> <member> [member...], ZRANGE <key> <start> <stop>, ZINCRBY <key> <increment> <member>, QUIT"
     );
 
     for line in stdin.lock().lines() {
@@ -874,7 +998,7 @@ fn main() {
                     continue;
                 }
                 let key = parts[1].trim();
-                let storage = storage.lock().unwrap();
+                let mut storage = storage.lock().unwrap();
                 match storage.ttl(key) {
                     Some(-1) => writeln!(stdout_lock, "(integer) -1").unwrap(),
                     Some(t) => writeln!(stdout_lock, "(integer) {}", t).unwrap(),
@@ -1205,6 +1329,169 @@ fn main() {
                     }
                 }
             }
+            "ZADD" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: ZADD requires <key> <score> <member> [score member...]").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() < 3 || tokens.len() % 2 == 0 {
+                    writeln!(stdout_lock, "Error: ZADD requires <key> <score> <member> [score member...]").unwrap();
+                    continue;
+                }
+                let key = tokens[0];
+                let mut entries: Vec<(f64, String)> = Vec::new();
+                let mut parse_error = false;
+                let mut i = 1;
+                while i < tokens.len() {
+                    let score = match tokens[i].parse::<f64>() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            writeln!(stdout_lock, "Error: ZADD score must be a number").unwrap();
+                            parse_error = true;
+                            break;
+                        }
+                    };
+                    entries.push((score, tokens[i + 1].to_string()));
+                    i += 2;
+                }
+                if parse_error {
+                    continue;
+                }
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_zset_key(key) {
+                    writeln!(stdout_lock, "Error: WRONGTYPE Operation against a key holding the wrong kind of value").unwrap();
+                    continue;
+                }
+                let added = storage.zadd(key, &entries);
+                if storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+                writeln!(stdout_lock, "(integer) {}", added).unwrap();
+            }
+            "ZCARD" => {
+                if parts.len() < 2 || parts[1].is_empty() {
+                    writeln!(stdout_lock, "Error: ZCARD requires a key").unwrap();
+                    continue;
+                }
+                let key = parts[1].trim();
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_zset_key(key) {
+                    writeln!(stdout_lock, "Error: WRONGTYPE Operation against a key holding the wrong kind of value").unwrap();
+                    continue;
+                }
+                writeln!(stdout_lock, "(integer) {}", storage.zcard(key)).unwrap();
+            }
+            "ZSCORE" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: ZSCORE requires <key> <member>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 2 {
+                    writeln!(stdout_lock, "Error: ZSCORE requires <key> <member>").unwrap();
+                    continue;
+                }
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_zset_key(tokens[0]) {
+                    writeln!(stdout_lock, "Error: WRONGTYPE Operation against a key holding the wrong kind of value").unwrap();
+                    continue;
+                }
+                match storage.zscore(tokens[0], tokens[1]) {
+                    Some(score) => writeln!(stdout_lock, "{}", score).unwrap(),
+                    None => writeln!(stdout_lock, "(nil)").unwrap(),
+                }
+            }
+            "ZREM" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: ZREM requires <key> <member> [member...]").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() < 2 {
+                    writeln!(stdout_lock, "Error: ZREM requires <key> <member> [member...]").unwrap();
+                    continue;
+                }
+                let key = tokens[0];
+                let members: Vec<String> = tokens[1..].iter().map(|s| (*s).to_string()).collect();
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_zset_key(key) {
+                    writeln!(stdout_lock, "Error: WRONGTYPE Operation against a key holding the wrong kind of value").unwrap();
+                    continue;
+                }
+                let removed = storage.zrem(key, &members);
+                if removed > 0 && storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+                writeln!(stdout_lock, "(integer) {}", removed).unwrap();
+            }
+            "ZRANGE" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: ZRANGE requires <key> <start> <stop>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 3 {
+                    writeln!(stdout_lock, "Error: ZRANGE requires <key> <start> <stop>").unwrap();
+                    continue;
+                }
+                let start: isize = match tokens[1].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        writeln!(stdout_lock, "Error: ZRANGE start must be an integer").unwrap();
+                        continue;
+                    }
+                };
+                let stop: isize = match tokens[2].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        writeln!(stdout_lock, "Error: ZRANGE stop must be an integer").unwrap();
+                        continue;
+                    }
+                };
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_zset_key(tokens[0]) {
+                    writeln!(stdout_lock, "Error: WRONGTYPE Operation against a key holding the wrong kind of value").unwrap();
+                    continue;
+                }
+                match storage.zrange(tokens[0], start, stop) {
+                    Some(values) if values.is_empty() => writeln!(stdout_lock, "(empty array)").unwrap(),
+                    Some(values) => {
+                        for value in values {
+                            writeln!(stdout_lock, "- {}", value).unwrap();
+                        }
+                    }
+                    None => writeln!(stdout_lock, "(nil)").unwrap(),
+                }
+            }
+            "ZINCRBY" => {
+                if parts.len() < 2 {
+                    writeln!(stdout_lock, "Error: ZINCRBY requires <key> <increment> <member>").unwrap();
+                    continue;
+                }
+                let tokens: Vec<&str> = parts[1].split_whitespace().collect();
+                if tokens.len() != 3 {
+                    writeln!(stdout_lock, "Error: ZINCRBY requires <key> <increment> <member>").unwrap();
+                    continue;
+                }
+                let increment: f64 = match tokens[1].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        writeln!(stdout_lock, "Error: ZINCRBY increment must be a number").unwrap();
+                        continue;
+                    }
+                };
+                let mut storage = storage.lock().unwrap();
+                if storage.is_non_zset_key(tokens[0]) {
+                    writeln!(stdout_lock, "Error: WRONGTYPE Operation against a key holding the wrong kind of value").unwrap();
+                    continue;
+                }
+                let score = storage.zincrby(tokens[0], increment, tokens[2].to_string());
+                if storage.maybe_persist().is_err() {
+                    writeln!(stdout_lock, "Warning: Persist failed").unwrap();
+                }
+                writeln!(stdout_lock, "{}", score).unwrap();
+            }
             "QUIT" => {
                 writeln!(stdout_lock, "Goodbye!").unwrap();
                 break;
@@ -1408,5 +1695,93 @@ mod tests {
 
         assert_eq!(store.hlen("h"), 0);
         assert_eq!(store.hget("h", "a"), None);
+    }
+
+    #[test]
+    fn zadd_zscore_zcard_zrem_flow() {
+        let mut store = KVStore::new();
+        assert_eq!(
+            store.zadd(
+                "z",
+                &[(1.5, "a".to_string()), (2.0, "b".to_string()), (2.0, "c".to_string())],
+            ),
+            3
+        );
+        assert_eq!(store.zcard("z"), 3);
+        assert_eq!(store.zscore("z", "a"), Some(1.5));
+        assert_eq!(store.zadd("z", &[(3.0, "a".to_string())]), 0);
+        assert_eq!(store.zscore("z", "a"), Some(3.0));
+        assert_eq!(store.zrem("z", &["a".to_string(), "missing".to_string()]), 1);
+        assert_eq!(store.zcard("z"), 2);
+    }
+
+    #[test]
+    fn zrange_orders_by_score_then_member() {
+        let mut store = KVStore::new();
+        store.zadd(
+            "z",
+            &[
+                (2.0, "b".to_string()),
+                (1.0, "c".to_string()),
+                (2.0, "a".to_string()),
+                (1.0, "aa".to_string()),
+            ],
+        );
+        assert_eq!(
+            store.zrange("z", 0, -1),
+            Some(vec![
+                "aa".to_string(),
+                "c".to_string(),
+                "a".to_string(),
+                "b".to_string()
+            ])
+        );
+        assert_eq!(store.zrange("z", 1, 2), Some(vec!["c".to_string(), "a".to_string()]));
+    }
+
+    #[test]
+    fn zincrby_updates_and_creates_members() {
+        let mut store = KVStore::new();
+        store.zadd("z", &[(1.0, "a".to_string())]);
+        assert_eq!(store.zincrby("z", 2.5, "a".to_string()), 3.5);
+        assert_eq!(store.zincrby("z", 1.0, "b".to_string()), 1.0);
+        assert_eq!(store.zscore("z", "a"), Some(3.5));
+        assert_eq!(store.zscore("z", "b"), Some(1.0));
+    }
+
+    #[test]
+    fn zset_reads_reflect_immediate_expiration_without_get() {
+        let mut store = KVStore::new();
+        store.zadd("z", &[(1.0, "a".to_string())]);
+        assert!(store.expire("z", 0));
+
+        assert_eq!(store.zcard("z"), 0);
+        assert_eq!(store.zscore("z", "a"), None);
+        assert_eq!(store.zrange("z", 0, -1), None);
+    }
+
+    #[test]
+    fn zset_type_conflict_overwrites_and_blocks_other_types() {
+        let mut store = KVStore::new();
+        store.set_with_ttl("k".to_string(), "v".to_string(), None);
+        store.zadd("k", &[(1.0, "a".to_string())]);
+        assert_eq!(store.get("k"), None);
+        assert!(store.is_non_string_key("k"));
+
+        store.hset("h", &[("f".to_string(), "1".to_string())]);
+        store.zadd("h", &[(1.0, "x".to_string())]);
+        assert_eq!(store.hget("h", "f"), None);
+
+        store.zadd("lz", &[(1.0, "m".to_string())]);
+        store.rpush("lz", &["x".to_string()]);
+        assert_eq!(store.zscore("lz", "m"), None);
+    }
+
+    #[test]
+    fn keys_and_exists_include_zsets() {
+        let mut store = KVStore::new();
+        store.zadd("z", &[(1.0, "a".to_string())]);
+        assert!(store.exists_key("z"));
+        assert_eq!(store.keys(), vec!["z".to_string()]);
     }
 }
