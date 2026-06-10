@@ -456,6 +456,103 @@ mod tests {
     }
 
     #[test]
+    fn parses_multiple_streamed_command_arrays_in_order() {
+        let mut parser = RespParser::new();
+        parser.feed(
+            b"*2\r\n$3\r\nGET\r\n$3\r\none\r\n*3\r\n$3\r\nSET\r\n$3\r\ntwo\r\n$1\r\n2\r\n",
+        );
+
+        assert_eq!(
+            parser.next_command().expect("first command should parse"),
+            Some(vec!["GET".to_string(), "one".to_string()])
+        );
+        assert_eq!(
+            parser.next_command().expect("second command should parse"),
+            Some(vec!["SET".to_string(), "two".to_string(), "2".to_string()])
+        );
+        assert_eq!(parser.next_command().expect("buffer should now be empty"), None);
+    }
+
+    #[test]
+    fn command_parse_and_response_encode_round_trip() {
+        let mut parser = RespParser::new();
+        let mut store = crate::KVStore::new();
+        parser.feed(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+
+        let args = parser
+            .next_command()
+            .expect("SET command parse should not fail")
+            .expect("SET command should be complete");
+        let response = crate::execute_command(&mut store, &args);
+        assert_eq!(encode_resp_value(&response), b"+OK\r\n".to_vec());
+
+        parser.feed(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n");
+        let args = parser
+            .next_command()
+            .expect("GET command parse should not fail")
+            .expect("GET command should be complete");
+        let response = crate::execute_command(&mut store, &args);
+        assert_eq!(encode_resp_value(&response), b"$5\r\nvalue\r\n".to_vec());
+    }
+
+    #[test]
+    fn encodes_each_resp_value_variant() {
+        let cases = vec![
+            (RespValue::Simple("OK".to_string()), b"+OK\r\n".to_vec()),
+            (RespValue::Bulk("hello".to_string()), b"$5\r\nhello\r\n".to_vec()),
+            (RespValue::Int(-7), b":-7\r\n".to_vec()),
+            (
+                RespValue::Error("Error: nope".to_string()),
+                b"-ERR nope\r\n".to_vec(),
+            ),
+            (RespValue::Nil, b"$-1\r\n".to_vec()),
+            (
+                RespValue::Array(vec![RespValue::Bulk("x".to_string()), RespValue::Nil]),
+                b"*2\r\n$1\r\nx\r\n$-1\r\n".to_vec(),
+            ),
+        ];
+
+        for (value, encoded) in cases {
+            assert_eq!(encode_resp_value(&value), encoded);
+        }
+    }
+
+    #[test]
+    fn malformed_inputs_return_errors() {
+        let cases: Vec<&[u8]> = vec![
+            b"?bad\r\n",
+            b":not-an-int\r\n",
+            b"$-2\r\n",
+            b"*-2\r\n",
+            b"*1\r\n$-1\r\n",
+            b"*1\r\n-ERR no\r\n",
+            b"*1\r\n*0\r\n",
+        ];
+
+        for case in cases {
+            let err = parse_resp_command(case).expect_err("case should be malformed");
+            assert!(matches!(err, RespParseError::Malformed(_)));
+        }
+    }
+
+    #[test]
+    fn partial_streams_are_not_reported_as_malformed() {
+        let partial_cases: Vec<&[u8]> = vec![
+            b"+PIN",
+            b":12",
+            b"$5\r\nhe",
+            b"*2\r\n$3\r\nGET\r\n$3",
+        ];
+
+        for case in partial_cases {
+            assert_eq!(
+                parse_resp_command(case).expect("partial frame should not be malformed"),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn parses_command_array_from_bulk_strings() {
         let command = parse_resp_command(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
             .expect("parser should succeed")
