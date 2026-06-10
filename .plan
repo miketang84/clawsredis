@@ -1,0 +1,32 @@
+Architecture plan for issues #11-#18
+
+Module structure and file organization:
+- src/lib.rs should become the public library entry point and re-export shared modules/types.
+- src/store.rs should hold the source-of-truth KVStore implementation currently duplicated in src/main.rs, including strings, lists, hashes, sorted sets, TTL, basic pub/sub metadata, and bincode persistence helpers.
+- src/command.rs should define RespValue and execute_command(store: &mut KVStore, args: &[String]) -> RespValue. It should own command validation, type checks, persistence-triggering decisions, and Redis-like result mapping before encoding.
+- src/resp.rs should contain RESP2 parser/encoder code. Keep parsing from byte/reader streams independent from TCP and CLI so unit tests can exercise it directly.
+- src/server.rs should contain the TCP server loop: TcpListener bind, Arc<Mutex<KVStore>>, per-connection thread handling, RESP read/execute/write cycle, and graceful disconnect/error handling.
+- src/main.rs should become a thin binary wrapper for argument parsing and mode selection: load persistence, then run interactive CLI or server. CLI dispatch should route through execute_command rather than duplicating command logic.
+
+Shared types and boundaries:
+- KVStore is the core mutable state and should not depend on CLI, TCP, or RESP framing.
+- RespValue should be the command result abstraction shared by CLI and server. RESP encoding maps RespValue to bytes; CLI can format RespValue for terminal output.
+- Command parsing should remain separated by transport: CLI converts lines to Vec<String>, RESP parser converts RESP arrays to Vec<String>, both call execute_command.
+- Persistence path should be configured once on KVStore after --load/PERSIST handling. Mutating commands should call maybe_persist through the shared command path where current behavior requires it.
+
+Issue dependency order:
+1. #11 Promote full KVStore into the library; eliminate duplicate store logic.
+2. #12 Add RespValue and execute_command; refactor CLI command dispatch through it.
+3. #13 Implement RESP2 request parser.
+4. #14 Implement RESP2 response encoder and map command results to RESP.
+5. #15 Add RESP codec unit tests; depends on parser and encoder.
+6. #16 Add TCP server loop using shared store and command execution.
+7. #17 Add CLI argument parsing for --server and --load combinations.
+8. #18 Add server integration tests and redis-cli smoke-check documentation.
+
+Key design decisions:
+- Keep storage in-process; no external database is required for these issues.
+- Preserve current command behavior while moving code; behavior changes should be introduced only when required by later issues.
+- Use deterministic output ordering where existing behavior already relies on it, especially KEYS/hash listings/sorted-set ranges.
+- Make RESP parser tolerant of partial streamed input but strict about malformed protocol data.
+- Use standard-library TCP/threading primitives to match the current simple project shape and avoid unnecessary async dependencies.
