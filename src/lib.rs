@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read};
 
+pub mod resp;
+pub use resp::{parse_resp_command, read_resp_command, RespFrame, RespParseError, RespParser};
+
 type Storage = HashMap<String, String>;
 type ListStorage = HashMap<String, Vec<String>>;
 type HashStorage = HashMap<String, HashMap<String, String>>;
