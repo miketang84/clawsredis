@@ -582,6 +582,599 @@ impl KVStore {
     }
 }
 
+/// Shared command result used by the CLI today and the RESP server in later issues.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RespValue {
+    /// A successful status response.
+    Simple(String),
+    /// An error response.
+    Error(String),
+    /// An integer response.
+    Int(i64),
+    /// A non-null string response.
+    Bulk(String),
+    /// A null response.
+    Nil,
+    /// A list of response values.
+    Array(Vec<RespValue>),
+}
+
+fn persist_or_error(store: &mut KVStore) -> Option<RespValue> {
+    match store.maybe_persist() {
+        Ok(()) => None,
+        Err(_) => Some(RespValue::Error("Warning: Persist failed".to_string())),
+    }
+}
+
+fn wrong_type() -> RespValue {
+    RespValue::Error("Error: WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+}
+
+/// Executes a parsed command against the provided store.
+///
+/// `args[0]` is the command name and remaining items are command arguments.
+pub fn execute_command(store: &mut KVStore, args: &[String]) -> RespValue {
+    if args.is_empty() {
+        return RespValue::Error("Error: command required".to_string());
+    }
+
+    let command = args[0].to_uppercase();
+    match command.as_str() {
+        "GET" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: GET requires a key".to_string());
+            }
+            match store.get(&args[1]) {
+                Some(value) => RespValue::Bulk(value.clone()),
+                None => RespValue::Nil,
+            }
+        }
+        "SET" => {
+            if args.len() < 3 {
+                return RespValue::Error("Error: SET requires <key> <value> [TTL]".to_string());
+            }
+            let ttl = if args.len() >= 4 {
+                match args[3].parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(_) => return RespValue::Error("Error: Invalid TTL value".to_string()),
+                }
+            } else {
+                None
+            };
+            store.set_with_ttl(args[1].clone(), args[2].clone(), ttl);
+            persist_or_error(store).unwrap_or_else(|| RespValue::Simple("OK".to_string()))
+        }
+        "SETNX" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: SETNX requires <key> <value>".to_string());
+            }
+            let inserted = store.setnx(args[1].clone(), args[2].clone());
+            if inserted {
+                if let Some(err) = persist_or_error(store) {
+                    return err;
+                }
+            }
+            RespValue::Int(if inserted { 1 } else { 0 })
+        }
+        "SETEX" => {
+            if args.len() != 4 {
+                return RespValue::Error("Error: SETEX requires <key> <seconds> <value>".to_string());
+            }
+            let ttl = match args[2].parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => return RespValue::Error("Error: Invalid TTL value".to_string()),
+            };
+            store.setex(args[1].clone(), args[3].clone(), ttl);
+            persist_or_error(store).unwrap_or_else(|| RespValue::Simple("OK".to_string()))
+        }
+        "MSET" | "MSETNX" => {
+            if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+                return RespValue::Error(format!(
+                    "Error: {} requires even number of key/value args",
+                    command
+                ));
+            }
+            let mut kvs: Vec<(String, String)> = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                kvs.push((args[i].clone(), args[i + 1].clone()));
+                i += 2;
+            }
+            if command == "MSET" {
+                store.mset(&kvs);
+                persist_or_error(store).unwrap_or_else(|| RespValue::Simple("OK".to_string()))
+            } else {
+                let inserted = store.msetnx(&kvs);
+                if inserted {
+                    if let Some(err) = persist_or_error(store) {
+                        return err;
+                    }
+                }
+                RespValue::Int(if inserted { 1 } else { 0 })
+            }
+        }
+        "MGET" => {
+            if args.len() < 2 {
+                return RespValue::Error("Error: MGET requires <k1> [k2...]".to_string());
+            }
+            let keys: Vec<String> = args[1..].to_vec();
+            RespValue::Array(
+                store
+                    .mget(&keys)
+                    .into_iter()
+                    .map(|value| match value {
+                        Some(v) => RespValue::Bulk(v),
+                        None => RespValue::Nil,
+                    })
+                    .collect(),
+            )
+        }
+        "APPEND" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: APPEND requires <key> <value>".to_string());
+            }
+            if store.is_non_string_key(&args[1]) {
+                return wrong_type();
+            }
+            let len = store.append(args[1].clone(), args[2].clone());
+            if let Some(err) = persist_or_error(store) {
+                return err;
+            }
+            RespValue::Int(len as i64)
+        }
+        "STRLEN" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: STRLEN requires a key".to_string());
+            }
+            if store.is_non_string_key(&args[1]) {
+                return wrong_type();
+            }
+            RespValue::Int(store.strlen(&args[1]) as i64)
+        }
+        "GETSET" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: GETSET requires <key> <value>".to_string());
+            }
+            if store.is_non_string_key(&args[1]) {
+                return wrong_type();
+            }
+            let previous = store.getset(args[1].clone(), args[2].clone());
+            if let Some(err) = persist_or_error(store) {
+                return err;
+            }
+            match previous {
+                Some(v) => RespValue::Bulk(v),
+                None => RespValue::Nil,
+            }
+        }
+        "INCR" | "DECR" | "INCRBY" | "DECRBY" => {
+            if args.len() < 2 {
+                return RespValue::Error(format!("Error: {} requires arguments", command));
+            }
+            let (key, delta): (&str, i64) = match command.as_str() {
+                "INCR" | "DECR" => {
+                    if args.len() != 2 {
+                        return RespValue::Error(format!("Error: {} requires <key>", command));
+                    }
+                    (&args[1], if command == "INCR" { 1 } else { -1 })
+                }
+                "INCRBY" | "DECRBY" => {
+                    if args.len() != 3 {
+                        return RespValue::Error(format!("Error: {} requires <key> <n>", command));
+                    }
+                    let n = match args[2].parse::<i64>() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return RespValue::Error(format!(
+                                "Error: {} value must be an integer",
+                                command
+                            ))
+                        }
+                    };
+                    (&args[1], if command == "INCRBY" { n } else { -n })
+                }
+                _ => unreachable!(),
+            };
+            if store.is_non_string_key(key) {
+                return wrong_type();
+            }
+            match store.incrby(key.to_string(), delta) {
+                Ok(v) => {
+                    if let Some(err) = persist_or_error(store) {
+                        return err;
+                    }
+                    RespValue::Int(v)
+                }
+                Err(msg) => RespValue::Error(msg.to_string()),
+            }
+        }
+        "DEL" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: DEL requires a key".to_string());
+            }
+            let deleted = store.del(&args[1]);
+            if let Some(err) = persist_or_error(store) {
+                return err;
+            }
+            RespValue::Int(if deleted { 1 } else { 0 })
+        }
+        "KEYS" => RespValue::Array(store.keys().into_iter().map(RespValue::Bulk).collect()),
+        "SUBSCRIBE" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: SUBSCRIBE requires a channel".to_string());
+            }
+            let sub_id = store.subscribe(args[1].clone());
+            RespValue::Simple(format!("Subscribed to {} with ID {}", args[1], sub_id))
+        }
+        "PUBLISH" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: PUBLISH requires <channel> <message>".to_string());
+            }
+            let count = store.publish(&args[1], args[2].clone());
+            RespValue::Simple(format!("Published to {} ({} subscribers)", args[1], count))
+        }
+        "UNSUBSCRIBE" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: UNSUBSCRIBE requires <channel> <sub_id>".to_string());
+            }
+            let sub_id = match args[2].parse::<usize>() {
+                Ok(id) => id,
+                Err(_) => return RespValue::Error("Error: Invalid subscription ID".to_string()),
+            };
+            store.unsubscribe(&args[1], sub_id);
+            RespValue::Simple(format!("Unsubscribed from {} (ID {})", args[1], sub_id))
+        }
+        "TTL" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: TTL requires a key".to_string());
+            }
+            match store.ttl(&args[1]) {
+                Some(t) => RespValue::Int(t),
+                None => RespValue::Nil,
+            }
+        }
+        "EXPIRE" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: EXPIRE requires <key> <seconds>".to_string());
+            }
+            let ttl = match args[2].parse::<u64>() {
+                Ok(t) => t,
+                Err(_) => return RespValue::Error("Error: Invalid TTL value".to_string()),
+            };
+            if store.expire(&args[1], ttl) {
+                if let Some(err) = persist_or_error(store) {
+                    return err;
+                }
+                RespValue::Simple("OK".to_string())
+            } else {
+                RespValue::Int(0)
+            }
+        }
+        "PERSISTKEY" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: PERSISTKEY requires a key".to_string());
+            }
+            if store.persist_key(&args[1]) {
+                if let Some(err) = persist_or_error(store) {
+                    return err;
+                }
+                RespValue::Simple("OK".to_string())
+            } else {
+                RespValue::Int(0)
+            }
+        }
+        "PERSIST" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: PERSIST requires <path>".to_string());
+            }
+            store.set_persist_path(args[1].clone());
+            match store.maybe_persist() {
+                Ok(()) => RespValue::Simple(format!("Persistence enabled: {}", args[1])),
+                Err(_) => RespValue::Error("Error: Failed to persist".to_string()),
+            }
+        }
+        "RPUSH" | "LPUSH" => {
+            if args.len() < 3 {
+                return RespValue::Error(format!(
+                    "Error: {} requires <key> <v1> [v2...]",
+                    command
+                ));
+            }
+            let values: Vec<String> = args[2..].to_vec();
+            let len = if command == "RPUSH" {
+                store.rpush(&args[1], &values)
+            } else {
+                store.lpush(&args[1], &values)
+            };
+            if let Some(err) = persist_or_error(store) {
+                return err;
+            }
+            RespValue::Int(len as i64)
+        }
+        "LRANGE" => {
+            if args.len() != 4 {
+                return RespValue::Error("Error: LRANGE requires <key> <start> <stop>".to_string());
+            }
+            let start = match args[2].parse::<isize>() {
+                Ok(v) => v,
+                Err(_) => return RespValue::Error("Error: LRANGE start must be an integer".to_string()),
+            };
+            let stop = match args[3].parse::<isize>() {
+                Ok(v) => v,
+                Err(_) => return RespValue::Error("Error: LRANGE stop must be an integer".to_string()),
+            };
+            match store.lrange(&args[1], start, stop) {
+                Some(values) => RespValue::Array(values.into_iter().map(RespValue::Bulk).collect()),
+                None => RespValue::Nil,
+            }
+        }
+        "LLEN" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: LLEN requires a key".to_string());
+            }
+            RespValue::Int(store.llen(&args[1]).unwrap_or(0) as i64)
+        }
+        "HSET" | "HMSET" => {
+            if args.len() < 4 || args.len() % 2 != 0 {
+                return RespValue::Error(format!(
+                    "Error: {} requires <key> <field> <value> [field value...]",
+                    command
+                ));
+            }
+            let mut items: Vec<(String, String)> = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                items.push((args[i].clone(), args[i + 1].clone()));
+                i += 2;
+            }
+            let added = store.hset(&args[1], &items);
+            if let Some(err) = persist_or_error(store) {
+                return err;
+            }
+            if command == "HSET" {
+                RespValue::Int(added as i64)
+            } else {
+                RespValue::Simple("OK".to_string())
+            }
+        }
+        "HGET" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: HGET requires <key> <field>".to_string());
+            }
+            match store.hget(&args[1], &args[2]) {
+                Some(value) => RespValue::Bulk(value),
+                None => RespValue::Nil,
+            }
+        }
+        "HMGET" => {
+            if args.len() < 3 {
+                return RespValue::Error("Error: HMGET requires <key> <field> [field...]".to_string());
+            }
+            let fields: Vec<String> = args[2..].to_vec();
+            RespValue::Array(
+                store
+                    .hmget(&args[1], &fields)
+                    .into_iter()
+                    .map(|value| match value {
+                        Some(v) => RespValue::Bulk(v),
+                        None => RespValue::Nil,
+                    })
+                    .collect(),
+            )
+        }
+        "HDEL" => {
+            if args.len() < 3 {
+                return RespValue::Error("Error: HDEL requires <key> <field> [field...]".to_string());
+            }
+            let fields: Vec<String> = args[2..].to_vec();
+            let removed = store.hdel(&args[1], &fields);
+            if removed > 0 {
+                if let Some(err) = persist_or_error(store) {
+                    return err;
+                }
+            }
+            RespValue::Int(removed as i64)
+        }
+        "HEXISTS" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: HEXISTS requires <key> <field>".to_string());
+            }
+            RespValue::Int(if store.hexists(&args[1], &args[2]) { 1 } else { 0 })
+        }
+        "HLEN" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: HLEN requires a key".to_string());
+            }
+            RespValue::Int(store.hlen(&args[1]) as i64)
+        }
+        "HKEYS" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: HKEYS requires a key".to_string());
+            }
+            RespValue::Array(store.hkeys(&args[1]).into_iter().map(RespValue::Bulk).collect())
+        }
+        "HVALS" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: HVALS requires a key".to_string());
+            }
+            RespValue::Array(store.hvals(&args[1]).into_iter().map(RespValue::Bulk).collect())
+        }
+        "HGETALL" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: HGETALL requires a key".to_string());
+            }
+            let values = store
+                .hgetall(&args[1])
+                .into_iter()
+                .flat_map(|(field, value)| [RespValue::Bulk(field), RespValue::Bulk(value)])
+                .collect();
+            RespValue::Array(values)
+        }
+        "ZADD" => {
+            if args.len() < 4 || args.len() % 2 != 0 {
+                return RespValue::Error("Error: ZADD requires <key> <score> <member> [score member...]".to_string());
+            }
+            if store.is_non_zset_key(&args[1]) {
+                return wrong_type();
+            }
+            let mut entries: Vec<(f64, String)> = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                let score = match args[i].parse::<f64>() {
+                    Ok(v) => v,
+                    Err(_) => return RespValue::Error("Error: ZADD score must be a number".to_string()),
+                };
+                entries.push((score, args[i + 1].clone()));
+                i += 2;
+            }
+            let added = store.zadd(&args[1], &entries);
+            if let Some(err) = persist_or_error(store) {
+                return err;
+            }
+            RespValue::Int(added as i64)
+        }
+        "ZCARD" => {
+            if args.len() != 2 {
+                return RespValue::Error("Error: ZCARD requires a key".to_string());
+            }
+            if store.is_non_zset_key(&args[1]) {
+                return wrong_type();
+            }
+            RespValue::Int(store.zcard(&args[1]) as i64)
+        }
+        "ZSCORE" => {
+            if args.len() != 3 {
+                return RespValue::Error("Error: ZSCORE requires <key> <member>".to_string());
+            }
+            if store.is_non_zset_key(&args[1]) {
+                return wrong_type();
+            }
+            match store.zscore(&args[1], &args[2]) {
+                Some(score) => RespValue::Bulk(score.to_string()),
+                None => RespValue::Nil,
+            }
+        }
+        "ZREM" => {
+            if args.len() < 3 {
+                return RespValue::Error("Error: ZREM requires <key> <member> [member...]".to_string());
+            }
+            if store.is_non_zset_key(&args[1]) {
+                return wrong_type();
+            }
+            let members: Vec<String> = args[2..].to_vec();
+            let removed = store.zrem(&args[1], &members);
+            if removed > 0 {
+                if let Some(err) = persist_or_error(store) {
+                    return err;
+                }
+            }
+            RespValue::Int(removed as i64)
+        }
+        "ZRANGE" => {
+            if args.len() != 4 {
+                return RespValue::Error("Error: ZRANGE requires <key> <start> <stop>".to_string());
+            }
+            if store.is_non_zset_key(&args[1]) {
+                return wrong_type();
+            }
+            let start = match args[2].parse::<isize>() {
+                Ok(v) => v,
+                Err(_) => return RespValue::Error("Error: ZRANGE start must be an integer".to_string()),
+            };
+            let stop = match args[3].parse::<isize>() {
+                Ok(v) => v,
+                Err(_) => return RespValue::Error("Error: ZRANGE stop must be an integer".to_string()),
+            };
+            match store.zrange(&args[1], start, stop) {
+                Some(values) => RespValue::Array(values.into_iter().map(RespValue::Bulk).collect()),
+                None => RespValue::Nil,
+            }
+        }
+        "ZINCRBY" => {
+            if args.len() != 4 {
+                return RespValue::Error("Error: ZINCRBY requires <key> <increment> <member>".to_string());
+            }
+            if store.is_non_zset_key(&args[1]) {
+                return wrong_type();
+            }
+            let increment = match args[2].parse::<f64>() {
+                Ok(v) => v,
+                Err(_) => return RespValue::Error("Error: ZINCRBY increment must be a number".to_string()),
+            };
+            let score = store.zincrby(&args[1], increment, args[3].clone());
+            if let Some(err) = persist_or_error(store) {
+                return err;
+            }
+            RespValue::Bulk(score.to_string())
+        }
+        "QUIT" => RespValue::Simple("Goodbye!".to_string()),
+        _ => RespValue::Error(format!("Unknown command: {}", command)),
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn execute_command_handles_string_flow() {
+        let mut store = KVStore::new();
+
+        assert_eq!(
+            execute_command(&mut store, &args(&["SET", "k", "v"])),
+            RespValue::Simple("OK".to_string())
+        );
+        assert_eq!(
+            execute_command(&mut store, &args(&["GET", "k"])),
+            RespValue::Bulk("v".to_string())
+        );
+        assert_eq!(
+            execute_command(&mut store, &args(&["DEL", "k"])),
+            RespValue::Int(1)
+        );
+        assert_eq!(
+            execute_command(&mut store, &args(&["GET", "k"])),
+            RespValue::Nil
+        );
+    }
+
+    #[test]
+    fn execute_command_returns_arrays_for_multi_value_results() {
+        let mut store = KVStore::new();
+        assert_eq!(
+            execute_command(&mut store, &args(&["MSET", "a", "1", "b", "2"])),
+            RespValue::Simple("OK".to_string())
+        );
+
+        assert_eq!(
+            execute_command(&mut store, &args(&["MGET", "a", "missing", "b"])),
+            RespValue::Array(vec![
+                RespValue::Bulk("1".to_string()),
+                RespValue::Nil,
+                RespValue::Bulk("2".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn execute_command_reports_argument_errors() {
+        let mut store = KVStore::new();
+
+        assert_eq!(
+            execute_command(&mut store, &args(&["SET", "only-key"])),
+            RespValue::Error("Error: SET requires <key> <value> [TTL]".to_string())
+        );
+        assert_eq!(
+            execute_command(&mut store, &args(&["NOPE"])),
+            RespValue::Error("Unknown command: NOPE".to_string())
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
