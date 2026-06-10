@@ -2,7 +2,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-use test001::{execute_command, KVStore, RespValue};
+use test001::{execute_command, run_server, KVStore, RespValue};
 
 fn parse_cli_args(input: &str) -> Vec<String> {
     let trimmed = input.trim();
@@ -72,29 +72,96 @@ fn write_cli_array_item<W: Write>(writer: &mut W, value: &RespValue) -> io::Resu
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let storage: Arc<Mutex<KVStore>>;
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CliOptions {
+    server_addr: Option<String>,
+    load_path: Option<String>,
+}
 
-    if args.len() > 1 && args[1] == "--load" {
-        if args.len() < 3 {
-            eprintln!("Usage: {} --load <path>", args[0]);
-            std::process::exit(1);
-        }
-        match KVStore::load(&args[2]) {
-            Ok(store) => {
-                storage = Arc::new(Mutex::new(store));
-                println!("Loaded state from {}", &args[2]);
+fn parse_options(args: &[String]) -> Result<CliOptions, String> {
+    let mut options = CliOptions::default();
+    let mut index = 1;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--server" => {
+                let value = option_value(args, index, "--server")?;
+                options.server_addr = Some(value.to_string());
+                index += 2;
             }
-            Err(e) => {
-                eprintln!("Failed to load state: {}", e);
-                storage = Arc::new(Mutex::new(KVStore::new()));
+            "--load" => {
+                let value = option_value(args, index, "--load")?;
+                options.load_path = Some(value.to_string());
+                index += 2;
             }
+            "--help" | "-h" => return Err(usage(program_name(args))),
+            unknown => return Err(format!(
+                "Unknown argument: {}\n{}",
+                unknown,
+                usage(program_name(args))
+            )),
         }
-    } else {
-        storage = Arc::new(Mutex::new(KVStore::new()));
     }
 
+    Ok(options)
+}
+
+fn option_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, String> {
+    match args.get(index + 1) {
+        Some(value) if !value.starts_with("--") => Ok(value),
+        _ => Err(format!("{} requires a value\n{}", flag, usage(program_name(args)))),
+    }
+}
+
+fn program_name(args: &[String]) -> &str {
+    args.first().map_or("clawsredis", String::as_str)
+}
+
+fn usage(program: &str) -> String {
+    format!(
+        "Usage: {} [--load <path>] [--server <addr>]\nDefault mode is interactive CLI when --server is omitted.",
+        program
+    )
+}
+
+fn load_store(load_path: Option<&str>) -> KVStore {
+    match load_path {
+        Some(path) => match KVStore::load(path) {
+            Ok(store) => {
+                println!("Loaded state from {}", path);
+                store
+            }
+            Err(err) => {
+                eprintln!("Failed to load state from {}: {}", path, err);
+                let mut store = KVStore::new();
+                store.set_persist_path(path.to_string());
+                store
+            }
+        },
+        None => KVStore::new(),
+    }
+}
+
+fn main() {
+    if let Err(err) = run_app(env::args().collect()) {
+        eprintln!("{}", err);
+        std::process::exit(1);
+    }
+}
+
+fn run_app(args: Vec<String>) -> Result<(), String> {
+    let options = parse_options(&args)?;
+    let storage = Arc::new(Mutex::new(load_store(options.load_path.as_deref())));
+
+    if let Some(addr) = options.server_addr {
+        println!("KV Storage (Redis-like) - RESP server listening on {}", addr);
+        run_server(addr.as_str(), storage).map_err(|err| format!("Server failed: {}", err))
+    } else {
+        run_interactive_cli(storage).map_err(|err| format!("CLI failed: {}", err))
+    }
+}
+
+fn run_interactive_cli(storage: Arc<Mutex<KVStore>>) -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout_lock = stdout.lock();
@@ -123,17 +190,57 @@ fn main() {
             Err(_) => RespValue::Error("Error: storage lock poisoned".to_string()),
         };
 
-        if let Err(err) = write_cli_value(&mut stdout_lock, &response) {
-            eprintln!("Failed to write output: {}", err);
-            break;
-        }
-        if let Err(err) = stdout_lock.flush() {
-            eprintln!("Failed to flush output: {}", err);
-            break;
-        }
+        write_cli_value(&mut stdout_lock, &response)?;
+        stdout_lock.flush()?;
 
         if command_args[0].eq_ignore_ascii_case("QUIT") {
             break;
         }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_options_defaults_to_cli() {
+        assert_eq!(
+            parse_options(&args(&["clawsredis"])).expect("default args should parse"),
+            CliOptions::default()
+        );
+    }
+
+    #[test]
+    fn parse_options_accepts_load_and_server_in_any_order() {
+        assert_eq!(
+            parse_options(&args(&["clawsredis", "--load", "dump.bin", "--server", "127.0.0.1:6379"]))
+                .expect("load then server should parse"),
+            CliOptions {
+                load_path: Some("dump.bin".to_string()),
+                server_addr: Some("127.0.0.1:6379".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_options(&args(&["clawsredis", "--server", "127.0.0.1:6379", "--load", "dump.bin"]))
+                .expect("server then load should parse"),
+            CliOptions {
+                load_path: Some("dump.bin".to_string()),
+                server_addr: Some("127.0.0.1:6379".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_options_rejects_missing_values_and_unknown_flags() {
+        assert!(parse_options(&args(&["clawsredis", "--server"])).is_err());
+        assert!(parse_options(&args(&["clawsredis", "--load"])).is_err());
+        assert!(parse_options(&args(&["clawsredis", "--bad"])).is_err());
     }
 }
