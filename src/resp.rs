@@ -1,5 +1,7 @@
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+
+use crate::RespValue;
 
 /// A parsed RESP2 frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +118,80 @@ pub fn parse_resp_command(bytes: &[u8]) -> Result<Option<Vec<String>>, RespParse
     let mut parser = RespParser::new();
     parser.feed(bytes);
     parser.next_command()
+}
+
+/// Encodes a command result as RESP2 bytes.
+pub fn encode_resp_value(value: &RespValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_resp_value_into(value, &mut out);
+    out
+}
+
+/// Writes a command result as RESP2 bytes.
+pub fn write_resp_value<W: Write>(writer: &mut W, value: &RespValue) -> io::Result<()> {
+    writer.write_all(&encode_resp_value(value))
+}
+
+fn encode_resp_value_into(value: &RespValue, out: &mut Vec<u8>) {
+    match value {
+        RespValue::Simple(message) => encode_simple(message, out),
+        RespValue::Error(message) => encode_error(message, out),
+        RespValue::Int(value) => {
+            out.extend_from_slice(format!(":{}\r\n", value).as_bytes());
+        }
+        RespValue::Bulk(message) => encode_bulk(Some(message.as_bytes()), out),
+        RespValue::Nil => encode_bulk(None, out),
+        RespValue::Array(values) => {
+            out.extend_from_slice(format!("*{}\r\n", values.len()).as_bytes());
+            for item in values {
+                encode_resp_value_into(item, out);
+            }
+        }
+    }
+}
+
+fn encode_simple(message: &str, out: &mut Vec<u8>) {
+    out.push(b'+');
+    out.extend_from_slice(resp_line(message).as_bytes());
+    out.extend_from_slice(b"\r\n");
+}
+
+fn encode_error(message: &str, out: &mut Vec<u8>) {
+    let detail = error_detail(message);
+    out.extend_from_slice(b"-ERR");
+    if !detail.is_empty() {
+        out.push(b' ');
+        out.extend_from_slice(resp_line(detail).as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+}
+
+fn encode_bulk(bytes: Option<&[u8]>, out: &mut Vec<u8>) {
+    match bytes {
+        Some(bytes) => {
+            out.extend_from_slice(format!("${}\r\n", bytes.len()).as_bytes());
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\r\n");
+        }
+        None => out.extend_from_slice(b"$-1\r\n"),
+    }
+}
+
+fn resp_line(message: &str) -> String {
+    message
+        .chars()
+        .map(|ch| if ch == '\r' || ch == '\n' { ' ' } else { ch })
+        .collect()
+}
+
+fn error_detail(message: &str) -> &str {
+    if let Some(rest) = message.strip_prefix("Error: ") {
+        rest
+    } else if let Some(rest) = message.strip_prefix("ERR ") {
+        rest
+    } else {
+        message
+    }
 }
 
 enum ParseResult {
@@ -309,7 +385,75 @@ fn frame_to_argument(frame: RespFrame) -> Result<String, RespParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RespValue;
     use std::io::Cursor;
+
+    #[test]
+    fn encodes_resp_values() {
+        assert_eq!(
+            encode_resp_value(&RespValue::Simple("OK".to_string())),
+            b"+OK\r\n".to_vec()
+        );
+        assert_eq!(
+            encode_resp_value(&RespValue::Bulk("foo".to_string())),
+            b"$3\r\nfoo\r\n".to_vec()
+        );
+        assert_eq!(encode_resp_value(&RespValue::Nil), b"$-1\r\n".to_vec());
+        assert_eq!(encode_resp_value(&RespValue::Int(2)), b":2\r\n".to_vec());
+        assert_eq!(
+            encode_resp_value(&RespValue::Error("Error: bad input".to_string())),
+            b"-ERR bad input\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn encodes_arrays_recursively() {
+        let value = RespValue::Array(vec![
+            RespValue::Bulk("a".to_string()),
+            RespValue::Nil,
+            RespValue::Int(3),
+        ]);
+
+        assert_eq!(
+            encode_resp_value(&value),
+            b"*3\r\n$1\r\na\r\n$-1\r\n:3\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn maps_command_results_to_resp() {
+        let mut store = crate::KVStore::new();
+
+        let set = crate::execute_command(
+            &mut store,
+            &["SET".to_string(), "k".to_string(), "v".to_string()],
+        );
+        assert_eq!(encode_resp_value(&set), b"+OK\r\n".to_vec());
+
+        let get_hit = crate::execute_command(&mut store, &["GET".to_string(), "k".to_string()]);
+        assert_eq!(encode_resp_value(&get_hit), b"$1\r\nv\r\n".to_vec());
+
+        let get_miss = crate::execute_command(&mut store, &["GET".to_string(), "missing".to_string()]);
+        assert_eq!(encode_resp_value(&get_miss), b"$-1\r\n".to_vec());
+
+        let keys = crate::execute_command(&mut store, &["KEYS".to_string()]);
+        assert_eq!(encode_resp_value(&keys), b"*1\r\n$1\r\nk\r\n".to_vec());
+
+        let del = crate::execute_command(&mut store, &["DEL".to_string(), "k".to_string()]);
+        assert_eq!(encode_resp_value(&del), b":1\r\n".to_vec());
+
+        let err = crate::execute_command(&mut store, &["GET".to_string()]);
+        assert_eq!(encode_resp_value(&err), b"-ERR GET requires a key\r\n".to_vec());
+    }
+
+    #[test]
+    fn write_resp_value_writes_encoded_bytes() {
+        let mut out = Vec::new();
+        write_resp_value(&mut out, &RespValue::Simple("OK".to_string()))
+            .expect("write to Vec should succeed");
+
+        assert_eq!(out, b"+OK\r\n".to_vec());
+    }
 
     #[test]
     fn parses_command_array_from_bulk_strings() {
