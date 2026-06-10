@@ -5,10 +5,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read};
 
 pub mod resp;
+pub mod server;
 pub use resp::{
     encode_resp_value, parse_resp_command, read_resp_command, write_resp_value, RespFrame,
     RespParseError, RespParser,
 };
+pub use server::{handle_client, run_server, serve_listener, SharedStore};
 
 type Storage = HashMap<String, String>;
 type ListStorage = HashMap<String, Vec<String>>;
